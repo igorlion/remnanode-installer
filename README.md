@@ -99,14 +99,16 @@ docker compose logs --tail=100 -t
 
 ## Firewall
 
-После установки скрипт покажет обнаруженный `NODE_PORT`. Разреши подключение к нему только с IP панели:
+Для Ubuntu подготовлен отдельный интерактивный nftables-firewall. Он запрашивает IP панели, порт Node API, SSH-доступ, публичные TCP/UDP-порты и IPv6; перед применением выполняет dry run и ставит автоматический SSH-safe rollback.
 
 ```bash
-ufw insert 1 allow from PANEL_IP to any port NODE_PORT proto tcp
-ufw deny NODE_PORT/tcp
+curl -fsSL https://raw.githubusercontent.com/igorlion/remnanode-installer/main/firewall/remnawave-firewall.sh -o /tmp/remnawave-firewall.sh
+chmod +x /tmp/remnawave-firewall.sh
+sudo /tmp/remnawave-firewall.sh apply --dry-run
+sudo /tmp/remnawave-firewall.sh apply --rollback-seconds 180
 ```
 
-Перед включением UFW обязательно разреши свой SSH-порт и остальные необходимые сервисы.
+После применения не закрывай первую SSH-сессию: открой второе новое соединение и только после проверки введи `CONFIRM`. Полная инструкция: [firewall/README.md](firewall/README.md).
 
 ## Полезные команды
 

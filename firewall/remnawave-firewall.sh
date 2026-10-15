@@ -505,7 +505,7 @@ cmd_apply() {
   panel_port=$(ask "TCP-порт Remnawave Node API (обязательно)" "")
   ssh_port=$(ask "TCP-порт SSH" "$ssh_default")
   ssh_raw=$(ask "IP/CIDR, которым разрешён SSH" "$ssh_source_default")
-  tcp_raw=$(ask "Публичные TCP-порты (пусто = ни одного)" "")
+  tcp_raw=$(ask "Публичные TCP-порты (пусто = ни одного)" "80,443")
   udp_raw=$(ask "Публичные UDP-порты (пусто = ни одного)" "")
   if ask_yes_no "Открывать указанные публичные порты также по IPv6?" "$ipv6_default"; then ipv6_enabled=yes; else ipv6_enabled=no; fi
 

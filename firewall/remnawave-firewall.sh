@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
@@ -98,6 +98,24 @@ trim() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "$value"
+}
+
+clean_ip_input() {
+  local original=$1 cleaned
+  cleaned=$(LC_ALL=C printf '%s' "$original" | tr -cd '0123456789abcdefABCDEF:.,; ')
+  if [[ "$cleaned" != "$original" ]]; then
+    warn "Во вводе IP обнаружены и удалены посторонние символы. Использую: $cleaned"
+  fi
+  printf '%s' "$cleaned"
+}
+
+clean_port_input() {
+  local original=$1 cleaned
+  cleaned=$(LC_ALL=C printf '%s' "$original" | tr -cd '0123456789,; -')
+  if [[ "$cleaned" != "$original" ]]; then
+    warn "Во вводе портов обнаружены и удалены посторонние символы. Использую: $cleaned"
+  fi
+  printf '%s' "$cleaned"
 }
 
 validate_port() {
@@ -509,6 +527,12 @@ cmd_apply() {
   tcp_raw=$(ask "Публичные TCP-порты (пусто = ни одного)" "80,443")
   if ask_yes_no "Открывать указанные публичные порты также по IPv6?" "$ipv6_default"; then ipv6_enabled=yes; else ipv6_enabled=no; fi
 
+  panel_raw=$(clean_ip_input "$panel_raw")
+  ssh_raw=$(clean_ip_input "$ssh_raw")
+  panel_port=$(clean_port_input "$panel_port")
+  ssh_port=$(clean_port_input "$ssh_port")
+  tcp_raw=$(clean_port_input "$tcp_raw")
+
   [[ -n $(trim "$panel_raw") ]] || die "IP панели обязателен. Домен здесь использовать нельзя."
   [[ -n $(trim "$panel_port") ]] || die "Порт Remnawave Node API обязателен."
   validate_port "$panel_port" || die "Некорректный порт панели: $panel_port"
@@ -591,6 +615,8 @@ cmd_self_test() {
   [[ $(normalize_ips '2001:db8::1' 6) == '2001:db8::1/128' ]]
   [[ $(normalize_ips '0.0.0.0' 4) == '0.0.0.0/0' ]]
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
+  [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
+  [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]
   write_rules "$temp" 22 '203.0.113.7/32' '' 6666 '192.0.2.10/32' '' '80, 443' no
   grep -Fq 'policy drop' "$temp"
   grep -Fq 'ct state { established, related }' "$temp"

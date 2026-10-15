@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
@@ -190,6 +190,69 @@ current_ssh_source() {
   [[ -n ${SSH_CONNECTION:-} ]] && ip=$(awk '{print $1}' <<< "$SSH_CONNECTION")
   [[ -z "$ip" ]] && return 0
   printf '%s' "$ip"
+}
+
+current_ssh_server() {
+  [[ -n ${SSH_CONNECTION:-} ]] || return 0
+  awk '{print $3}' <<< "$SSH_CONNECTION"
+}
+
+node_ip_addresses() {
+  local ssh_server
+  ssh_server=$(current_ssh_server)
+  {
+    ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" {sub(/\/.*/, "", $4); print $4}'
+    [[ -n "$ssh_server" ]] && printf '%s\n' "$ssh_server"
+  } | awk 'NF && !seen[$0]++'
+}
+
+validate_panel_ips() {
+  local raw=$1
+  python3 - "$raw" <<'PY'
+import ipaddress, re, sys
+
+for value in re.split(r"[\s,;]+", sys.argv[1].strip()):
+    if not value:
+        continue
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise SystemExit(2)
+    if address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local:
+        print(f"Адрес {address} недопустим для удалённой панели.", file=sys.stderr)
+        raise SystemExit(1)
+PY
+}
+
+find_matching_ips() {
+  local wanted=$1 candidates=$2
+  python3 - "$wanted" "$candidates" <<'PY'
+import ipaddress, re, sys
+
+def addresses(text):
+    result = set()
+    for value in re.split(r"[\s,;]+", text.strip()):
+        if not value:
+            continue
+        try:
+            result.add(ipaddress.ip_address(value.split("/", 1)[0]))
+        except ValueError:
+            pass
+    return result
+
+for address in sorted(addresses(sys.argv[1]) & addresses(sys.argv[2]), key=lambda a: (a.version, int(a))):
+    print(address)
+PY
+}
+
+first_ip() {
+  python3 - "$1" <<'PY'
+import ipaddress, re, sys
+for value in re.split(r"[\s,;]+", sys.argv[1].strip()):
+    if value:
+        print(ipaddress.ip_address(value))
+        break
+PY
 }
 
 detect_ipv6_default() {
@@ -512,14 +575,19 @@ cmd_apply() {
   fi
   [[ "$os_id" == "ubuntu" ]] || warn "Скрипт рассчитан на Ubuntu; обнаружено: $os_name."
 
-  local ssh_default current_ssh_ip ipv6_default
+  local ssh_default current_ssh_ip ipv6_default node_ips
   ssh_default=$(current_ssh_port); ssh_default=${ssh_default:-22}
   current_ssh_ip=$(current_ssh_source)
   ipv6_default=$(detect_ipv6_default)
+  node_ips=$(node_ip_addresses)
 
   info "Будет изменена только таблица nftables '$TABLE_FAMILY $TABLE_NAME'."
   local panel_raw panel_port ssh_port ssh_raw tcp_raw ipv6_enabled
-  panel_raw=$(ask "IP панели Remnawave (обязательно, не домен; несколько IP — через запятую)" "")
+  printf '\nНужен публичный ИСХОДЯЩИЙ IP сервера Remnawave Panel.\n'
+  printf 'Это адрес, С КОТОРОГО панель подключается к Node API этой ноды.\n'
+  printf 'НЕ вводите IP настраиваемой ноды.\n'
+  [[ -n "$node_ips" ]] && printf 'Обнаруженные IP этой ноды: %s\n\n' "${node_ips//$'\n'/, }"
+  panel_raw=$(ask "Исходящий IP сервера панели (не IP ноды; несколько IP — через запятую)" "")
   panel_port=$(ask "TCP-порт Remnawave Node API (обязательно)" "")
   ssh_port=$(ask "TCP-порт SSH" "$ssh_default")
   [[ -n "$current_ssh_ip" ]] && info "Текущий SSH-клиент: $current_ssh_ip. Если этот IP постоянный, безопаснее указать его вместо значения по умолчанию."
@@ -546,6 +614,12 @@ cmd_apply() {
   tcp_ports=$(normalize_ports "$tcp_raw")
   [[ -n "$panel_v4$panel_v6" ]] || die "Нужно указать хотя бы один адрес панели."
   [[ -n "$ssh_v4$ssh_v6" ]] || die "Нужно указать хотя бы один адрес/диапазон для SSH."
+  validate_panel_ips "$panel_raw" || die "Укажите обычный unicast-адрес удалённой панели. Ничего не применено."
+  local collisions panel_confirm expected_panel
+  collisions=$(find_matching_ips "$panel_raw" "$node_ips")
+  if [[ -n "$collisions" ]]; then
+    die "IP панели совпадает с адресом этой ноды: ${collisions//$'\n'/, }. Вероятно, введён IP ноды вместо исходящего IP панели. Ничего не применено."
+  fi
   if [[ "$ipv6_enabled" == no && -n "$ssh_v6$panel_v6" ]]; then
     warn "IPv6 для публичных портов выключен, но адресные SSH/панельные разрешения IPv6 сохранены."
   fi
@@ -554,6 +628,16 @@ cmd_apply() {
   elif [[ -n "$current_ssh_ip" && "$ssh_raw" != *"$current_ssh_ip"* ]]; then
     warn "Текущий SSH-клиент $current_ssh_ip не виден во введённой строке. Проверьте IP особенно внимательно."
   fi
+
+  expected_panel=$(first_ip "$panel_raw")
+  printf '\nПроверка критичных адресов:\n'
+  printf '  IP панели:       %s\n' "$panel_raw"
+  printf '  IP этой ноды:    %s\n' "${node_ips//$'\n'/, }"
+  printf '  Node API:        TCP/%s\n' "$panel_port"
+  panel_confirm=$(ask "Повторите первый IP панели ($expected_panel), чтобы подтвердить источник доступа к Node API" "")
+  panel_confirm=$(trim "$panel_confirm")
+  [[ "$panel_confirm" == "$expected_panel" ]] \
+    || die "IP не совпал: ожидался $expected_panel. Ничего не применено."
 
   check_conflicts
   local generated
@@ -614,6 +698,13 @@ cmd_self_test() {
   [[ $(normalize_ips '192.0.2.10, 198.51.100.7' 4) == '192.0.2.10/32, 198.51.100.7/32' ]]
   [[ $(normalize_ips '2001:db8::1' 6) == '2001:db8::1/128' ]]
   [[ $(normalize_ips '0.0.0.0' 4) == '0.0.0.0/0' ]]
+  validate_panel_ips '192.0.2.10, 2001:db8::10'
+  ! validate_panel_ips '0.0.0.0' >/dev/null 2>&1
+  ! validate_panel_ips '127.0.0.1' >/dev/null 2>&1
+  ! validate_panel_ips '::1' >/dev/null 2>&1
+  [[ $(find_matching_ips '2.27.61.13, 193.168.197.139' $'10.0.0.1\n2.27.61.13') == '2.27.61.13' ]]
+  [[ -z $(find_matching_ips '193.168.197.139' $'10.0.0.1\n2.27.61.13') ]]
+  [[ $(first_ip '193.168.197.139, 198.51.100.7') == '193.168.197.139' ]]
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
   [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
   [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]

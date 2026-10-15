@@ -99,7 +99,7 @@ docker compose logs --tail=100 -t
 
 ## Firewall
 
-Для Ubuntu подготовлен отдельный интерактивный nftables-firewall. Он запрашивает IP панели, порт Node API, SSH-доступ, публичные TCP/UDP-порты и IPv6; перед применением выполняет dry run и ставит автоматический SSH-safe rollback.
+Для Ubuntu подготовлен отдельный интерактивный nftables-firewall. Он запрашивает IP панели, порт Node API, SSH-доступ, публичные TCP-порты и IPv6; перед применением выполняет dry run и ставит автоматический SSH-safe rollback.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/igorlion/remnanode-installer/main/firewall/remnawave-firewall.sh -o /tmp/remnawave-firewall.sh

@@ -322,7 +322,9 @@ node_ip_addresses() {
   ssh_server=$(current_ssh_server)
   {
     ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" {sub(/\/.*/, "", $4); print $4}'
-    [[ -n "$ssh_server" ]] && printf '%s\n' "$ssh_server"
+    if [[ -n "$ssh_server" ]]; then
+      printf '%s\n' "$ssh_server"
+    fi
   } | awk 'NF && !seen[$0]++'
 }
 
@@ -871,6 +873,9 @@ cmd_self_test() {
   ! validate_panel_ips '::1' >/dev/null 2>&1
   [[ $(find_matching_ips '2.27.61.13, 193.168.197.139' $'10.0.0.1\n2.27.61.13') == '2.27.61.13' ]]
   [[ -z $(find_matching_ips '193.168.197.139' $'10.0.0.1\n2.27.61.13') ]]
+  ip() { return 0; }
+  SSH_CONNECTION= node_ip_addresses >/dev/null
+  unset -f ip
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
   [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
   [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]

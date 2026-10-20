@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.2.1"
+readonly VERSION="1.2.2"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
@@ -824,10 +824,13 @@ cmd_apply() {
   extra_work=$(mktemp)
   trap 'rm -f "${generated:-}" "${extra_work:-}"' EXIT
   prepare_extra_workfile "$extra_work"
-  printf '\nДоступ к портам только с доверенных IP-адресов:\n'
-  printf 'Здесь открывают порт не всему интернету, а только выбранной ноде или серверу.\n'
-  printf 'Для моста AlphaUS: TCP и UDP, порт 9999, разрешённый IP 195.209.211.140.\n'
-  printf 'Добавленные здесь разрешения сохраняются и автоматически используются при следующих apply.\n\n'
+  printf '\nДоступ к порту этой ноды для RU-ноды:\n'
+  printf 'Текущая обычная нода принимает подключение, а RU-нода его инициирует.\n'
+  printf 'Укажите порт моста на этой ноде и публичный IP RU-ноды, откуда приходит подключение.\n'
+  printf 'Порт будет доступен только с указанной RU-ноды и закрыт для остального интернета.\n'
+  printf 'Пример: TCP и UDP, порт 9999, публичный IP RU-ноды 198.51.100.20.\n'
+  printf 'Адрес 198.51.100.20 учебный — замените его реальным публичным IP своей RU-ноды.\n'
+  printf 'Добавленные здесь разрешения сохраняются и автоматически используются при следующих применениях правил.\n\n'
   show_extra_rules "$extra_work"
   if grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work" \
      && ! ask_yes_no "Оставить эти разрешения включёнными?" y; then
@@ -836,13 +839,13 @@ cmd_apply() {
     write_extra_header "$extra_work"
   fi
   while [[ $(ask_menu \
-    "Добавить доступ к порту только для конкретного IP-адреса?" 2 \
-    "Да — указать порт и доверенный IP; остальным доступ будет закрыт" \
+    "Разрешить RU-ноде подключаться к порту на этой ноде?" 2 \
+    "Да — указать порт на этой ноде и публичный IP RU-ноды" \
     "Нет — больше ограниченных разрешений добавлять не нужно") == 1 ]]; do
     protocol=$(ask_protocol)
-    extra_ports=$(ask "Порт или диапазон портов (для AlphaUS: 9999)" "")
-    extra_sources=$(ask "Доверенный IP, которому разрешён доступ (для AlphaUS: 195.209.211.140)" "")
-    extra_label=$(ask "Название разрешения, чтобы потом его узнать (для AlphaUS: AlphaUS)" "Дополнительный доступ")
+    extra_ports=$(ask "Порт или диапазон портов (пример: 9999)" "")
+    extra_sources=$(ask "Публичный IP RU-ноды, откуда приходит подключение (пример: 198.51.100.20)" "")
+    extra_label=$(ask "Название разрешения, чтобы потом его узнать (пример: RU-нода)" "RU-нода")
     append_extra_rule "$extra_work" "$protocol" "$extra_ports" "$extra_sources" "$extra_label"
     validate_extra_config "$extra_work" || die "Не удалось сформировать дополнительное правило."
     ok "Разрешение добавлено. Оно будет показано в итоговой конфигурации ниже."
@@ -930,23 +933,23 @@ cmd_self_test() {
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
   [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
   [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]
-  [[ $(normalize_allowed_sources '195.209.211.140' 4) == '195.209.211.140/32' ]]
+  [[ $(normalize_allowed_sources '198.51.100.20' 4) == '198.51.100.20/32' ]]
   [[ $(normalize_allowed_sources '2001:db8::1/128' 6) == '2001:db8::1/128' ]]
   ! normalize_allowed_sources '0.0.0.0/0' >/dev/null 2>&1
   ! normalize_allowed_sources '::/0' >/dev/null 2>&1
   write_extra_header "$extras"
-  append_extra_rule "$extras" both 9999 '195.209.211.140' AlphaUS
+  append_extra_rule "$extras" both 9999 '198.51.100.20' BRIDGE-node
   validate_extra_config "$extras"
-  printf 'tcp|0|195.209.211.140|bad\n' > "$bad_extras"
+  printf 'tcp|0|198.51.100.20|bad\n' > "$bad_extras"
   ! validate_extra_config "$bad_extras" >/dev/null 2>&1
-  write_rules "$temp" 22 '203.0.113.7/32' '' 38471 '5.144.181.9/32' '' '80, 443' no "$extras"
+  write_rules "$temp" 22 '203.0.113.7/32' '' 38471 '192.0.2.10/32' '' '80, 443' no "$extras"
   grep -Fq 'policy drop' "$temp"
   grep -Fq 'ct state { established, related }' "$temp"
-  grep -Fq 'ip saddr { 5.144.181.9/32 } tcp dport 38471' "$temp"
+  grep -Fq 'ip saddr { 192.0.2.10/32 } tcp dport 38471' "$temp"
   grep -Fq 'meta nfproto ipv4 tcp dport { 80, 443 }' "$temp"
-  grep -Fq 'ip saddr { 195.209.211.140/32 } tcp dport { 9999 }' "$temp"
-  grep -Fq 'ip saddr { 195.209.211.140/32 } udp dport { 9999 }' "$temp"
-  write_rules "$temp_second" 22 '203.0.113.7/32' '' 38471 '5.144.181.9/32' '' '80, 443' no "$extras"
+  grep -Fq 'ip saddr { 198.51.100.20/32 } tcp dport { 9999 }' "$temp"
+  grep -Fq 'ip saddr { 198.51.100.20/32 } udp dport { 9999 }' "$temp"
+  write_rules "$temp_second" 22 '203.0.113.7/32' '' 38471 '192.0.2.10/32' '' '80, 443' no "$extras"
   cmp -s "$temp" "$temp_second"
   ! grep -Fq 'set public_tcp' "$temp"
   ! grep -Fq 'flush ruleset' "$temp"

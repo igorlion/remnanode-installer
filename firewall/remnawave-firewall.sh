@@ -365,16 +365,6 @@ for address in sorted(addresses(sys.argv[1]) & addresses(sys.argv[2]), key=lambd
 PY
 }
 
-first_ip() {
-  python3 - "$1" <<'PY'
-import ipaddress, re, sys
-for value in re.split(r"[\s,;]+", sys.argv[1].strip()):
-    if value:
-        print(ipaddress.ip_address(value))
-        break
-PY
-}
-
 detect_ipv6_default() {
   ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' && printf 'y' || printf 'n'
 }
@@ -768,7 +758,7 @@ cmd_apply() {
   [[ -n "$panel_v4$panel_v6" ]] || die "Нужно указать хотя бы один адрес панели."
   [[ -n "$ssh_v4$ssh_v6" ]] || die "Нужно указать хотя бы один адрес/диапазон для SSH."
   validate_panel_ips "$panel_raw" || die "Укажите обычный unicast-адрес удалённой панели. Ничего не применено."
-  local collisions panel_confirm expected_panel
+  local collisions
   collisions=$(find_matching_ips "$panel_raw" "$node_ips")
   if [[ -n "$collisions" ]]; then
     die "IP панели совпадает с адресом этой ноды: ${collisions//$'\n'/, }. Вероятно, введён IP ноды вместо исходящего IP панели. Ничего не применено."
@@ -807,15 +797,10 @@ cmd_apply() {
   done
   validate_extra_config "$extra_work" || die "Реестр дополнительных правил некорректен; ничего не изменено."
 
-  expected_panel=$(first_ip "$panel_raw")
   printf '\nПроверка критичных адресов:\n'
   printf '  IP панели:       %s\n' "$panel_raw"
   printf '  IP этой ноды:    %s\n' "${node_ips//$'\n'/, }"
   printf '  Node API:        TCP/%s\n' "$panel_port"
-  panel_confirm=$(ask "Повторите первый IP панели ($expected_panel), чтобы подтвердить источник доступа к Node API" "")
-  panel_confirm=$(trim "$panel_confirm")
-  [[ "$panel_confirm" == "$expected_panel" ]] \
-    || die "IP не совпал: ожидался $expected_panel. Ничего не применено."
 
   check_conflicts
   write_rules "$generated" "$ssh_port" "$ssh_v4" "$ssh_v6" "$panel_port" "$panel_v4" "$panel_v6" "$tcp_ports" "$ipv6_enabled" "$extra_work"
@@ -853,7 +838,8 @@ cmd_apply() {
   fi
   ok "Правила применены. Старое SSH-соединение сохранится благодаря established/related."
   warn "НЕ подтверждайте вслепую: откройте второе НОВОЕ SSH-соединение и проверьте доступ панели/VLESS."
-  printf 'После успешной проверки введите CONFIRM. Любой другой ответ немедленно откатит правила.\n'
+  printf 'После успешной проверки введите CONFIRM\n'
+  printf 'Любой другой ответ немедленно откатит правила.\n'
   local confirmation=""
   read -r confirmation || confirmation=""
   if [[ "$confirmation" == "CONFIRM" ]]; then
@@ -885,7 +871,6 @@ cmd_self_test() {
   ! validate_panel_ips '::1' >/dev/null 2>&1
   [[ $(find_matching_ips '2.27.61.13, 193.168.197.139' $'10.0.0.1\n2.27.61.13') == '2.27.61.13' ]]
   [[ -z $(find_matching_ips '193.168.197.139' $'10.0.0.1\n2.27.61.13') ]]
-  [[ $(first_ip '193.168.197.139, 198.51.100.7') == '193.168.197.139' ]]
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
   [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
   [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]

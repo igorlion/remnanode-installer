@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
@@ -115,8 +115,10 @@ ask_yes_no() {
 
 ask_protocol() {
   local choice
-  choice=$(ask_menu "Какой протокол разрешить?" 3 \
-    "TCP" "UDP" "TCP и UDP")
+  choice=$(ask_menu "Какой трафик разрешить на этом порту?" 3 \
+    "Только TCP" \
+    "Только UDP" \
+    "TCP и UDP — обычно этот вариант нужен для моста")
   case "$choice" in
     1) printf 'tcp' ;;
     2) printf 'udp' ;;
@@ -758,7 +760,7 @@ cmd_apply() {
   node_ips=$(node_ip_addresses)
 
   info "Будет изменена только таблица nftables '$TABLE_FAMILY $TABLE_NAME'."
-  local panel_raw panel_port ssh_port ssh_raw tcp_extra_raw tcp_raw ipv6_enabled
+  local panel_raw panel_port ssh_port ssh_raw tcp_extra_raw tcp_raw ipv6_enabled ipv6_choice
   printf '\nНужен публичный ИСХОДЯЩИЙ IP сервера Remnawave Panel.\n'
   printf 'Это адрес, С КОТОРОГО панель подключается к Node API этой ноды.\n'
   printf 'НЕ вводите IP настраиваемой ноды.\n'
@@ -768,8 +770,18 @@ cmd_apply() {
   ssh_port=$(ask "TCP-порт SSH" "$ssh_default")
   [[ -n "$current_ssh_ip" ]] && info "Текущий SSH-клиент: $current_ssh_ip. Если этот IP постоянный, безопаснее указать его вместо значения по умолчанию."
   ssh_raw=$(ask "IP, которым разрешён SSH (0.0.0.0 = доступ всем)" "0.0.0.0")
-  tcp_extra_raw=$(ask "Введите дополнительные публичные TCP-порты. Порты 80 и 443 уже включены; если другие не нужны, нажмите Enter" "")
-  if ask_yes_no "Разрешить публичные TCP-порты также через IPv6?" "$ipv6_default"; then ipv6_enabled=yes; else ipv6_enabled=no; fi
+  printf '\nПубличные TCP-порты — доступны всему интернету, без ограничения по IP.\n'
+  printf 'Порты 80 и 443 уже включены автоматически.\n'
+  printf 'Не вводите здесь порт моста, если он должен быть доступен только с другой ноды.\n'
+  tcp_extra_raw=$(ask "Другие публичные TCP-порты (если не нужны — просто нажмите Enter)" "")
+
+  [[ "$ipv6_default" == y ]] && ipv6_choice=1 || ipv6_choice=2
+  ipv6_choice=$(ask_menu \
+    "Как открыть публичные TCP-порты 80, 443 и указанные выше? UDP этот выбор не открывает." \
+    "$ipv6_choice" \
+    "По IPv4 и IPv6 — TCP-порты будут доступны через обе сети" \
+    "Только по IPv4 — через IPv6 эти TCP-порты будут закрыты")
+  [[ "$ipv6_choice" == 1 ]] && ipv6_enabled=yes || ipv6_enabled=no
 
   panel_raw=$(clean_ip_input "$panel_raw")
   ssh_raw=$(clean_ip_input "$ssh_raw")
@@ -812,7 +824,10 @@ cmd_apply() {
   extra_work=$(mktemp)
   trap 'rm -f "${generated:-}" "${extra_work:-}"' EXIT
   prepare_extra_workfile "$extra_work"
-  printf '\nРазрешения для отдельных IP-адресов:\n'
+  printf '\nДоступ к портам только с доверенных IP-адресов:\n'
+  printf 'Здесь открывают порт не всему интернету, а только выбранной ноде или серверу.\n'
+  printf 'Для моста AlphaUS: TCP и UDP, порт 9999, разрешённый IP 195.209.211.140.\n'
+  printf 'Добавленные здесь разрешения сохраняются и автоматически используются при следующих apply.\n\n'
   show_extra_rules "$extra_work"
   if grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work" \
      && ! ask_yes_no "Оставить эти разрешения включёнными?" y; then
@@ -820,11 +835,14 @@ cmd_apply() {
     [[ "$reset_word" == RESET ]] || die "Сброс не подтверждён; ничего не изменено."
     write_extra_header "$extra_work"
   fi
-  while ask_yes_no "Нужно открыть отдельный порт только для выбранного IP-адреса?" n; do
+  while [[ $(ask_menu \
+    "Добавить доступ к порту только для конкретного IP-адреса?" 2 \
+    "Да — указать порт и доверенный IP; остальным доступ будет закрыт" \
+    "Нет — больше ограниченных разрешений добавлять не нужно") == 1 ]]; do
     protocol=$(ask_protocol)
-    extra_ports=$(ask "Введите порт, который нужно открыть. Например, 9999" "")
-    extra_sources=$(ask "Введите IP-адрес, с которого можно подключаться. Например, 195.209.211.140" "")
-    extra_label=$(ask "Введите понятное название для этого разрешения" "Дополнительный доступ")
+    extra_ports=$(ask "Порт или диапазон портов (для AlphaUS: 9999)" "")
+    extra_sources=$(ask "Доверенный IP, которому разрешён доступ (для AlphaUS: 195.209.211.140)" "")
+    extra_label=$(ask "Название разрешения, чтобы потом его узнать (для AlphaUS: AlphaUS)" "Дополнительный доступ")
     append_extra_rule "$extra_work" "$protocol" "$extra_ports" "$extra_sources" "$extra_label"
     validate_extra_config "$extra_work" || die "Не удалось сформировать дополнительное правило."
     ok "Разрешение добавлено. Оно будет показано в итоговой конфигурации ниже."

@@ -6,15 +6,17 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.1.2"
+readonly VERSION="1.2.0"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
 readonly ETC_DIR="/etc/remnawave-firewall"
 readonly RULES_FILE="${ETC_DIR}/rules.nft"
+readonly EXTRA_RULES_FILE="${ETC_DIR}/extra-rules.conf"
 readonly STATE_DIR="/var/lib/remnawave-firewall"
 readonly BACKUP_DIR="${STATE_DIR}/backups"
 readonly PENDING_RULES="${STATE_DIR}/pending-rules.nft"
+readonly PENDING_EXTRA_RULES="${STATE_DIR}/pending-extra-rules.conf"
 readonly PENDING_BACKUP="${STATE_DIR}/pending-backup"
 readonly LAST_BACKUP="${STATE_DIR}/last-backup"
 readonly UNIT_FILE="/etc/systemd/system/remnawave-firewall.service"
@@ -38,6 +40,7 @@ usage() {
   sudo remnawave-firewall test
   sudo remnawave-firewall confirm
   sudo remnawave-firewall rollback [КАТАЛОГ_РЕЗЕРВНОЙ_КОПИИ]
+  sudo remnawave-firewall extra-list
   bash remnawave-firewall.sh self-test
 
 Команды:
@@ -46,6 +49,7 @@ usage() {
   test        Проверить установленную конфигурацию без её изменения.
   confirm     Отменить страховочный откат и закрепить ожидающие правила.
   rollback    Восстановить последнее предыдущее состояние.
+  extra-list  Показать постоянные адресные TCP/UDP-разрешения.
   self-test   Локальные тесты парсеров/генератора; firewall не меняется.
 
 Опции apply:
@@ -175,6 +179,122 @@ print(", ".join(dict.fromkeys(values)))
 PY
 }
 
+normalize_allowed_sources() {
+  local raw=$1 family=${2:-0}
+  python3 - "$raw" "$family" <<'PY'
+import ipaddress, re, sys
+
+raw, wanted = sys.argv[1], int(sys.argv[2])
+values = []
+for value in re.split(r"[\s,;]+", raw.strip()):
+    if not value:
+        continue
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError as exc:
+        print(f"Некорректный IP/префикс {value!r}: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    if network.prefixlen == 0:
+        print(f"Дополнительное правило должно быть ограничено источником; {network} запрещён.", file=sys.stderr)
+        raise SystemExit(2)
+    if network.network_address.is_unspecified or network.network_address.is_multicast:
+        print(f"Недопустимый источник: {network}", file=sys.stderr)
+        raise SystemExit(2)
+    if wanted in (0, network.version):
+        values.append(str(network))
+print(", ".join(dict.fromkeys(values)))
+PY
+}
+
+validate_extra_label() {
+  local label=$1 bytes
+  bytes=$(LC_ALL=C printf '%s' "$label" | wc -c | tr -d '[:space:]')
+  [[ -n "$label" && "$bytes" =~ ^[0-9]+$ && "$bytes" -le 48 ]] || return 1
+  [[ "$label" != *'"'* && "$label" != *'\'* && "$label" != *'|'* ]] || return 1
+  ! LC_ALL=C printf '%s' "$label" | grep -q '[[:cntrl:]]'
+}
+
+write_extra_header() {
+  cat > "$1" <<'EOF'
+# remnawave-firewall persistent source-restricted rules v1
+# protocol|ports|sources|label
+EOF
+  chmod 0600 "$1"
+}
+
+validate_extra_config() {
+  local file=$1 line_no=0 protocol ports sources label rest normalized
+  [[ -f "$file" ]] || return 0
+  while IFS='|' read -r protocol ports sources label rest || [[ -n "$protocol$ports$sources$label$rest" ]]; do
+    line_no=$((line_no + 1))
+    [[ -z "$protocol$ports$sources$label$rest" || "$protocol" == \#* ]] && continue
+    [[ -z "$rest" ]] || { warn "${file}:${line_no}: слишком много полей."; return 1; }
+    [[ "$protocol" == tcp || "$protocol" == udp ]] \
+      || { warn "${file}:${line_no}: протокол должен быть tcp или udp."; return 1; }
+    normalized=$(normalize_ports "$ports") || return 1
+    [[ -n "$normalized" ]] || { warn "${file}:${line_no}: порты не указаны."; return 1; }
+    normalized=$(normalize_allowed_sources "$sources") || return 1
+    [[ -n "$normalized" ]] || { warn "${file}:${line_no}: источники не указаны."; return 1; }
+    validate_extra_label "$label" \
+      || { warn "${file}:${line_no}: метка пуста, длиннее 48 байт или содержит запрещённый символ."; return 1; }
+  done < "$file"
+}
+
+append_extra_rule() {
+  local file=$1 protocol=$2 raw_ports=$3 raw_sources=$4 label=$5 ports sources line
+  ports=$(normalize_ports "$raw_ports")
+  [[ -n "$ports" ]] || die "Для дополнительного правила нужен хотя бы один порт."
+  sources=$(normalize_allowed_sources "$raw_sources") || die "Некорректные источники дополнительного правила."
+  [[ -n "$sources" ]] || die "Для дополнительного правила нужен хотя бы один IP/префикс."
+  validate_extra_label "$label" || die "Метка должна иметь 1..48 байт и не содержать кавычку, обратный слеш, | или управляющие символы."
+  case "$protocol" in
+    tcp|udp)
+      line="${protocol}|${ports}|${sources}|${label}"
+      grep -Fqx -- "$line" "$file" || printf '%s\n' "$line" >> "$file"
+      ;;
+    both)
+      line="tcp|${ports}|${sources}|${label}"
+      grep -Fqx -- "$line" "$file" || printf '%s\n' "$line" >> "$file"
+      line="udp|${ports}|${sources}|${label}"
+      grep -Fqx -- "$line" "$file" || printf '%s\n' "$line" >> "$file"
+      ;;
+    *) die "Протокол: tcp, udp или both." ;;
+  esac
+}
+
+prepare_extra_workfile() {
+  local target=$1
+  write_extra_header "$target"
+  if [[ -f "$EXTRA_RULES_FILE" ]]; then
+    validate_extra_config "$EXTRA_RULES_FILE" \
+      || die "Файл $EXTRA_RULES_FILE некорректен; ничего не изменено."
+    grep -vE '^[[:space:]]*(#|$)' "$EXTRA_RULES_FILE" >> "$target" || true
+  fi
+}
+
+show_extra_rules() {
+  local file=${1:-$EXTRA_RULES_FILE}
+  if [[ ! -f "$file" ]] || ! grep -qE '^[[:space:]]*[^#[:space:]]' "$file"; then
+    info "Постоянных дополнительных правил нет."
+    return 0
+  fi
+  printf 'Протокол | Порты | Источники | Метка\n'
+  grep -vE '^[[:space:]]*(#|$)' "$file" | sed 's/|/ | /g'
+}
+
+write_extra_nft_rules() {
+  local file=$1 protocol ports sources label rest v4 v6
+  [[ -f "$file" ]] || return 0
+  while IFS='|' read -r protocol ports sources label rest || [[ -n "$protocol$ports$sources$label$rest" ]]; do
+    [[ -z "$protocol$ports$sources$label$rest" || "$protocol" == \#* ]] && continue
+    v4=$(normalize_allowed_sources "$sources" 4)
+    v6=$(normalize_allowed_sources "$sources" 6)
+    [[ -n "$v4" ]] && printf '    ip saddr { %s } %s dport { %s } ct state new counter accept comment "extra: %s IPv4"\n' "$v4" "$protocol" "$ports" "$label"
+    [[ -n "$v6" ]] && printf '    ip6 saddr { %s } %s dport { %s } ct state new counter accept comment "extra: %s IPv6"\n' "$v6" "$protocol" "$ports" "$label"
+  done < "$file"
+  return 0
+}
+
 current_ssh_port() {
   if [[ -n ${SSH_CONNECTION:-} ]]; then
     awk '{print $4}' <<< "$SSH_CONNECTION"
@@ -202,9 +322,7 @@ node_ip_addresses() {
   ssh_server=$(current_ssh_server)
   {
     ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" {sub(/\/.*/, "", $4); print $4}'
-    if [[ -n "$ssh_server" ]]; then
-      printf '%s\n' "$ssh_server"
-    fi
+    [[ -n "$ssh_server" ]] && printf '%s\n' "$ssh_server"
   } | awk 'NF && !seen[$0]++'
 }
 
@@ -247,13 +365,23 @@ for address in sorted(addresses(sys.argv[1]) & addresses(sys.argv[2]), key=lambd
 PY
 }
 
+first_ip() {
+  python3 - "$1" <<'PY'
+import ipaddress, re, sys
+for value in re.split(r"[\s,;]+", sys.argv[1].strip()):
+    if value:
+        print(ipaddress.ip_address(value))
+        break
+PY
+}
+
 detect_ipv6_default() {
   ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' && printf 'y' || printf 'n'
 }
 
 write_rules() {
   local target=$1 ssh_port=$2 ssh_v4=$3 ssh_v6=$4 panel_port=$5 panel_v4=$6 panel_v6=$7
-  local tcp_ports=$8 ipv6_enabled=$9
+  local tcp_ports=$8 ipv6_enabled=$9 extra_file=${10}
   {
     printf '# Generated by remnawave-firewall %s\n' "$VERSION"
     printf '# Replaces only table %s %s; never flushes the complete ruleset.\n\n' "$TABLE_FAMILY" "$TABLE_NAME"
@@ -281,6 +409,7 @@ EOF
         && printf '    tcp dport { %s } ct state new counter accept comment "public TCP IPv4+IPv6"\n' "$tcp_ports" \
         || printf '    meta nfproto ipv4 tcp dport { %s } ct state new counter accept comment "public TCP IPv4 only"\n' "$tcp_ports"
     fi
+    write_extra_nft_rules "$extra_file"
     cat <<'EOF'
     counter comment "implicit default drop"
   }
@@ -373,6 +502,12 @@ make_backup() {
   else
     printf 'absent\n' > "${dir}/persistent.state"
   fi
+  if [[ -f "$EXTRA_RULES_FILE" ]]; then
+    cp -a "$EXTRA_RULES_FILE" "${dir}/extra-rules.conf"
+    printf 'present\n' > "${dir}/extra.state"
+  else
+    printf 'absent\n' > "${dir}/extra.state"
+  fi
   systemctl is-enabled --quiet remnawave-firewall.service 2>/dev/null \
     && printf 'enabled\n' > "${dir}/service.state" \
     || printf 'disabled\n' > "${dir}/service.state"
@@ -413,6 +548,11 @@ restore_persistent() {
     install -m 0600 "${dir}/persistent.nft" "$RULES_FILE"
   else
     rm -f "$RULES_FILE"
+  fi
+  if [[ -f "${dir}/extra.state" && $(<"${dir}/extra.state") == "present" ]]; then
+    install -m 0600 "${dir}/extra-rules.conf" "$EXTRA_RULES_FILE"
+  else
+    rm -f "$EXTRA_RULES_FILE"
   fi
   if [[ $(<"${dir}/service.state") == "enabled" ]]; then
     [[ -f "$UNIT_FILE" ]] && systemctl enable remnawave-firewall.service >/dev/null
@@ -473,9 +613,11 @@ EOF
 
 commit_pending() {
   local active_state sub_state
-  [[ -f "$PENDING_RULES" ]] || die "Нет ожидающей конфигурации для подтверждения."
+  [[ -f "$PENDING_RULES" && -f "$PENDING_EXTRA_RULES" ]] || die "Нет полной ожидающей конфигурации для подтверждения."
+  validate_extra_config "$PENDING_EXTRA_RULES" || die "Ожидающий файл дополнительных правил повреждён."
   mkdir -p "$ETC_DIR"
   install -m 0600 "$PENDING_RULES" "$RULES_FILE"
+  install -m 0600 "$PENDING_EXTRA_RULES" "$EXTRA_RULES_FILE"
   write_unit
   systemctl enable remnawave-firewall.service >/dev/null
   if ! systemctl start remnawave-firewall.service; then
@@ -483,17 +625,17 @@ commit_pending() {
   fi
   active_state=$(systemctl show remnawave-firewall.service --property=ActiveState --value)
   sub_state=$(systemctl show remnawave-firewall.service --property=SubState --value)
-  if [[ "$active_state" != "active" || "$sub_state" != "exited" ]]; then
-    die "remnawave-firewall.service не перешёл в состояние active (exited): ${active_state:-unknown} (${sub_state:-unknown}); страховочный откат остаётся активным."
+  if [[ "$active_state" != active || "$sub_state" != exited ]]; then
+    die "remnawave-firewall.service не перешёл в active (exited): ${active_state:-unknown} (${sub_state:-unknown}); страховочный откат остаётся активным."
   fi
   cancel_rollback_timer
-  rm -f "$PENDING_RULES" "$PENDING_BACKUP"
-  ok "Правила подтверждены; remnawave-firewall.service активен (exited) и включён в автозагрузку."
+  rm -f "$PENDING_RULES" "$PENDING_EXTRA_RULES" "$PENDING_BACKUP"
+  ok "Правила подтверждены; сервис active (exited) и включён в автозагрузку."
 }
 
 cmd_confirm() {
   need_root
-  need_commands systemctl nft
+  need_commands systemctl nft python3 install
   commit_pending
 }
 
@@ -514,7 +656,7 @@ cmd_rollback() {
   cancel_rollback_timer
   restore_runtime "$dir"
   restore_persistent "$dir"
-  rm -f "$PENDING_RULES" "$PENDING_BACKUP"
+  rm -f "$PENDING_RULES" "$PENDING_EXTRA_RULES" "$PENDING_BACKUP"
   ok "Восстановлено состояние из $dir"
 }
 
@@ -525,7 +667,7 @@ cmd_rollback_auto() {
   safe_backup_dir "$dir" || die "Некорректная резервная копия для автоотката."
   restore_runtime "$dir"
   restore_persistent "$dir"
-  rm -f "$PENDING_RULES" "$PENDING_BACKUP"
+  rm -f "$PENDING_RULES" "$PENDING_EXTRA_RULES" "$PENDING_BACKUP"
   logger -t remnawave-firewall "Automatic rollback completed from $dir" 2>/dev/null || true
 }
 
@@ -551,13 +693,23 @@ cmd_status() {
   ss -H -lntp 2>/dev/null || true
   printf '\nDocker network modes:\n'
   show_docker_networks
+  printf '\nПостоянные дополнительные правила:\n'
+  show_extra_rules
+}
+
+cmd_extra_list() {
+  need_root
+  need_commands python3
+  validate_extra_config "$EXTRA_RULES_FILE" || die "Файл $EXTRA_RULES_FILE некорректен."
+  show_extra_rules
 }
 
 cmd_test() {
   need_root
-  need_commands nft systemctl ss
+  need_commands nft systemctl ss python3
   local failures=0
   if [[ -f "$RULES_FILE" ]] && nft -c -f "$RULES_FILE"; then ok "Синтаксис сохранённых правил корректен."; else warn "Сохранённые правила отсутствуют или не проходят nft -c."; failures=$((failures+1)); fi
+  if validate_extra_config "$EXTRA_RULES_FILE"; then ok "Реестр дополнительных правил корректен."; else warn "Реестр дополнительных правил повреждён."; failures=$((failures+1)); fi
   if nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then ok "Таблица $TABLE_FAMILY $TABLE_NAME загружена."; else warn "Таблица не загружена."; failures=$((failures+1)); fi
   systemctl is-enabled --quiet remnawave-firewall.service && ok "Автозагрузка включена." || { warn "Автозагрузка не включена."; failures=$((failures+1)); }
   if count_foreign_drop_chains; then warn "Есть другая INPUT base-chain с policy drop: проверяйте совместимость вручную."; fi
@@ -616,7 +768,7 @@ cmd_apply() {
   [[ -n "$panel_v4$panel_v6" ]] || die "Нужно указать хотя бы один адрес панели."
   [[ -n "$ssh_v4$ssh_v6" ]] || die "Нужно указать хотя бы один адрес/диапазон для SSH."
   validate_panel_ips "$panel_raw" || die "Укажите обычный unicast-адрес удалённой панели. Ничего не применено."
-  local collisions
+  local collisions panel_confirm expected_panel
   collisions=$(find_matching_ips "$panel_raw" "$node_ips")
   if [[ -n "$collisions" ]]; then
     die "IP панели совпадает с адресом этой ноды: ${collisions//$'\n'/, }. Вероятно, введён IP ноды вместо исходящего IP панели. Ничего не применено."
@@ -630,21 +782,50 @@ cmd_apply() {
     warn "Текущий SSH-клиент $current_ssh_ip не виден во введённой строке. Проверьте IP особенно внимательно."
   fi
 
+  local generated extra_work reset_word protocol extra_ports extra_sources extra_label
+  generated=$(mktemp)
+  extra_work=$(mktemp)
+  trap 'rm -f "${generated:-}" "${extra_work:-}"' EXIT
+  prepare_extra_workfile "$extra_work"
+  printf '\nСохранённые дополнительные разрешения (они не потеряются при apply):\n'
+  show_extra_rules "$extra_work"
+  if grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work" \
+     && ! ask_yes_no "Сохранить все эти дополнительные правила?" y; then
+    reset_word=$(ask "Для удаления всех дополнительных правил введите RESET" "")
+    [[ "$reset_word" == RESET ]] || die "Сброс не подтверждён; ничего не изменено."
+    write_extra_header "$extra_work"
+  fi
+  while ask_yes_no "Добавить постоянное TCP/UDP-разрешение по IP?" n; do
+    protocol=$(ask "Протокол: tcp, udp или both" "both")
+    protocol=$(LC_ALL=C printf '%s' "$protocol" | tr '[:upper:]' '[:lower:]')
+    extra_ports=$(ask "Порты/диапазоны" "")
+    extra_sources=$(ask "Разрешённые IP или CIDR (0.0.0.0/0 и ::/0 запрещены)" "")
+    extra_label=$(ask "Короткая метка" "extra-service")
+    append_extra_rule "$extra_work" "$protocol" "$extra_ports" "$extra_sources" "$extra_label"
+    validate_extra_config "$extra_work" || die "Не удалось сформировать дополнительное правило."
+    ok "Дополнительное правило добавлено в ожидающую конфигурацию."
+  done
+  validate_extra_config "$extra_work" || die "Реестр дополнительных правил некорректен; ничего не изменено."
+
+  expected_panel=$(first_ip "$panel_raw")
   printf '\nПроверка критичных адресов:\n'
   printf '  IP панели:       %s\n' "$panel_raw"
   printf '  IP этой ноды:    %s\n' "${node_ips//$'\n'/, }"
   printf '  Node API:        TCP/%s\n' "$panel_port"
+  panel_confirm=$(ask "Повторите первый IP панели ($expected_panel), чтобы подтвердить источник доступа к Node API" "")
+  panel_confirm=$(trim "$panel_confirm")
+  [[ "$panel_confirm" == "$expected_panel" ]] \
+    || die "IP не совпал: ожидался $expected_panel. Ничего не применено."
 
   check_conflicts
-  local generated
-  generated=$(mktemp)
-  trap 'rm -f "${generated:-}"' EXIT
-  write_rules "$generated" "$ssh_port" "$ssh_v4" "$ssh_v6" "$panel_port" "$panel_v4" "$panel_v6" "$tcp_ports" "$ipv6_enabled"
+  write_rules "$generated" "$ssh_port" "$ssh_v4" "$ssh_v6" "$panel_port" "$panel_v4" "$panel_v6" "$tcp_ports" "$ipv6_enabled" "$extra_work"
   nft -c -f "$generated" || die "nftables отклонил конфигурацию; ничего не применено."
   ok "nft -c: конфигурация синтаксически корректна."
 
   printf '\nИтоговая конфигурация:\n'
   sed -n '1,240p' "$generated"
+  printf '\nПостоянные дополнительные правила:\n'
+  show_extra_rules "$extra_work"
   printf '\nСейчас слушают:\n'
   ss -H -lntp 2>/dev/null || true
   printf '\nDocker network modes:\n'
@@ -661,6 +842,7 @@ cmd_apply() {
   local backup
   backup=$(make_backup)
   install -m 0600 "$generated" "$PENDING_RULES"
+  install -m 0600 "$extra_work" "$PENDING_EXTRA_RULES"
   printf '%s\n' "$backup" > "$PENDING_BACKUP"
   printf '%s\n' "$backup" > "$LAST_BACKUP"
   schedule_rollback "$ROLLBACK_SECONDS" "$backup"
@@ -671,8 +853,7 @@ cmd_apply() {
   fi
   ok "Правила применены. Старое SSH-соединение сохранится благодаря established/related."
   warn "НЕ подтверждайте вслепую: откройте второе НОВОЕ SSH-соединение и проверьте доступ панели/VLESS."
-  printf 'После успешной проверки введите CONFIRM\n'
-  printf 'Любой другой ответ немедленно откатит правила.\n'
+  printf 'После успешной проверки введите CONFIRM. Любой другой ответ немедленно откатит правила.\n'
   local confirmation=""
   read -r confirmation || confirmation=""
   if [[ "$confirmation" == "CONFIRM" ]]; then
@@ -685,9 +866,12 @@ cmd_apply() {
 
 cmd_self_test() {
   need_commands python3
-  local temp
+  local temp extras temp_second bad_extras
   temp=$(mktemp)
-  trap 'rm -f "${temp:-}"' EXIT
+  extras=$(mktemp)
+  temp_second=$(mktemp)
+  bad_extras=$(mktemp)
+  trap 'rm -f "${temp:-}" "${extras:-}" "${temp_second:-}" "${bad_extras:-}"' EXIT
   validate_port 22
   ! validate_port 0
   ! validate_port 65536
@@ -701,15 +885,28 @@ cmd_self_test() {
   ! validate_panel_ips '::1' >/dev/null 2>&1
   [[ $(find_matching_ips '2.27.61.13, 193.168.197.139' $'10.0.0.1\n2.27.61.13') == '2.27.61.13' ]]
   [[ -z $(find_matching_ips '193.168.197.139' $'10.0.0.1\n2.27.61.13') ]]
-  SSH_CONNECTION= node_ip_addresses >/dev/null
+  [[ $(first_ip '193.168.197.139, 198.51.100.7') == '193.168.197.139' ]]
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
   [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
   [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]
-  write_rules "$temp" 22 '203.0.113.7/32' '' 6666 '192.0.2.10/32' '' '80, 443' no
+  [[ $(normalize_allowed_sources '195.209.211.140' 4) == '195.209.211.140/32' ]]
+  [[ $(normalize_allowed_sources '2001:db8::1/128' 6) == '2001:db8::1/128' ]]
+  ! normalize_allowed_sources '0.0.0.0/0' >/dev/null 2>&1
+  ! normalize_allowed_sources '::/0' >/dev/null 2>&1
+  write_extra_header "$extras"
+  append_extra_rule "$extras" both 9999 '195.209.211.140' AlphaUS
+  validate_extra_config "$extras"
+  printf 'tcp|0|195.209.211.140|bad\n' > "$bad_extras"
+  ! validate_extra_config "$bad_extras" >/dev/null 2>&1
+  write_rules "$temp" 22 '203.0.113.7/32' '' 38471 '5.144.181.9/32' '' '80, 443' no "$extras"
   grep -Fq 'policy drop' "$temp"
   grep -Fq 'ct state { established, related }' "$temp"
-  grep -Fq 'ip saddr { 192.0.2.10/32 } tcp dport 6666' "$temp"
+  grep -Fq 'ip saddr { 5.144.181.9/32 } tcp dport 38471' "$temp"
   grep -Fq 'meta nfproto ipv4 tcp dport { 80, 443 }' "$temp"
+  grep -Fq 'ip saddr { 195.209.211.140/32 } tcp dport { 9999 }' "$temp"
+  grep -Fq 'ip saddr { 195.209.211.140/32 } udp dport { 9999 }' "$temp"
+  write_rules "$temp_second" 22 '203.0.113.7/32' '' 38471 '5.144.181.9/32' '' '80, 443' no "$extras"
+  cmp -s "$temp" "$temp_second"
   ! grep -Fq 'set public_tcp' "$temp"
   ! grep -Fq 'flush ruleset' "$temp"
   if command -v nft >/dev/null 2>&1 && (( EUID == 0 )); then
@@ -747,6 +944,7 @@ main() {
     test) cmd_test ;;
     confirm) cmd_confirm ;;
     rollback) cmd_rollback "${rollback_arg:-}" ;;
+    extra-list) cmd_extra_list ;;
     rollback-auto) die "Внутренняя команда не может вызываться с общими опциями." ;;
     load) cmd_load ;;
     self-test) cmd_self_test ;;

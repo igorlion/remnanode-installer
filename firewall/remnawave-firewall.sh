@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.1.1"
+readonly VERSION="1.1.2"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
@@ -202,7 +202,9 @@ node_ip_addresses() {
   ssh_server=$(current_ssh_server)
   {
     ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" {sub(/\/.*/, "", $4); print $4}'
-    [[ -n "$ssh_server" ]] && printf '%s\n' "$ssh_server"
+    if [[ -n "$ssh_server" ]]; then
+      printf '%s\n' "$ssh_server"
+    fi
   } | awk 'NF && !seen[$0]++'
 }
 
@@ -242,16 +244,6 @@ def addresses(text):
 
 for address in sorted(addresses(sys.argv[1]) & addresses(sys.argv[2]), key=lambda a: (a.version, int(a))):
     print(address)
-PY
-}
-
-first_ip() {
-  python3 - "$1" <<'PY'
-import ipaddress, re, sys
-for value in re.split(r"[\s,;]+", sys.argv[1].strip()):
-    if value:
-        print(ipaddress.ip_address(value))
-        break
 PY
 }
 
@@ -480,14 +472,23 @@ EOF
 }
 
 commit_pending() {
+  local active_state sub_state
   [[ -f "$PENDING_RULES" ]] || die "Нет ожидающей конфигурации для подтверждения."
   mkdir -p "$ETC_DIR"
   install -m 0600 "$PENDING_RULES" "$RULES_FILE"
   write_unit
   systemctl enable remnawave-firewall.service >/dev/null
+  if ! systemctl start remnawave-firewall.service; then
+    die "Не удалось запустить remnawave-firewall.service; страховочный откат остаётся активным."
+  fi
+  active_state=$(systemctl show remnawave-firewall.service --property=ActiveState --value)
+  sub_state=$(systemctl show remnawave-firewall.service --property=SubState --value)
+  if [[ "$active_state" != "active" || "$sub_state" != "exited" ]]; then
+    die "remnawave-firewall.service не перешёл в состояние active (exited): ${active_state:-unknown} (${sub_state:-unknown}); страховочный откат остаётся активным."
+  fi
   cancel_rollback_timer
   rm -f "$PENDING_RULES" "$PENDING_BACKUP"
-  ok "Правила подтверждены и включены в автозагрузку."
+  ok "Правила подтверждены; remnawave-firewall.service активен (exited) и включён в автозагрузку."
 }
 
 cmd_confirm() {
@@ -615,7 +616,7 @@ cmd_apply() {
   [[ -n "$panel_v4$panel_v6" ]] || die "Нужно указать хотя бы один адрес панели."
   [[ -n "$ssh_v4$ssh_v6" ]] || die "Нужно указать хотя бы один адрес/диапазон для SSH."
   validate_panel_ips "$panel_raw" || die "Укажите обычный unicast-адрес удалённой панели. Ничего не применено."
-  local collisions panel_confirm expected_panel
+  local collisions
   collisions=$(find_matching_ips "$panel_raw" "$node_ips")
   if [[ -n "$collisions" ]]; then
     die "IP панели совпадает с адресом этой ноды: ${collisions//$'\n'/, }. Вероятно, введён IP ноды вместо исходящего IP панели. Ничего не применено."
@@ -629,15 +630,10 @@ cmd_apply() {
     warn "Текущий SSH-клиент $current_ssh_ip не виден во введённой строке. Проверьте IP особенно внимательно."
   fi
 
-  expected_panel=$(first_ip "$panel_raw")
   printf '\nПроверка критичных адресов:\n'
   printf '  IP панели:       %s\n' "$panel_raw"
   printf '  IP этой ноды:    %s\n' "${node_ips//$'\n'/, }"
   printf '  Node API:        TCP/%s\n' "$panel_port"
-  panel_confirm=$(ask "Повторите первый IP панели ($expected_panel), чтобы подтвердить источник доступа к Node API" "")
-  panel_confirm=$(trim "$panel_confirm")
-  [[ "$panel_confirm" == "$expected_panel" ]] \
-    || die "IP не совпал: ожидался $expected_panel. Ничего не применено."
 
   check_conflicts
   local generated
@@ -675,7 +671,8 @@ cmd_apply() {
   fi
   ok "Правила применены. Старое SSH-соединение сохранится благодаря established/related."
   warn "НЕ подтверждайте вслепую: откройте второе НОВОЕ SSH-соединение и проверьте доступ панели/VLESS."
-  printf 'После успешной проверки введите CONFIRM. Любой другой ответ немедленно откатит правила.\n'
+  printf 'После успешной проверки введите CONFIRM\n'
+  printf 'Любой другой ответ немедленно откатит правила.\n'
   local confirmation=""
   read -r confirmation || confirmation=""
   if [[ "$confirmation" == "CONFIRM" ]]; then
@@ -704,7 +701,7 @@ cmd_self_test() {
   ! validate_panel_ips '::1' >/dev/null 2>&1
   [[ $(find_matching_ips '2.27.61.13, 193.168.197.139' $'10.0.0.1\n2.27.61.13') == '2.27.61.13' ]]
   [[ -z $(find_matching_ips '193.168.197.139' $'10.0.0.1\n2.27.61.13') ]]
-  [[ $(first_ip '193.168.197.139, 198.51.100.7') == '193.168.197.139' ]]
+  SSH_CONNECTION= node_ip_addresses >/dev/null
   ! normalize_ips '192.0.2.10/32' 4 >/dev/null 2>&1
   [[ $(clean_ip_input $'2\321.27.61.13' 2>/dev/null) == '2.27.61.13' ]]
   [[ $(clean_port_input $'80,443\321' 2>/dev/null) == '80,443' ]]

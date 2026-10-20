@@ -83,18 +83,45 @@ ask() {
   fi
 }
 
-ask_yes_no() {
-  local prompt=$1 default=${2:-n} answer suffix
-  [[ "$default" == "y" ]] && suffix="Y/n" || suffix="y/N"
+ask_menu() {
+  local prompt=$1 default=$2 answer index
+  shift 2
+  local -a options=("$@")
   while true; do
-    read -r -p "$prompt [$suffix]: " answer || die "Ввод прерван."
+    printf '\n%s\n' "$prompt" >&2
+    index=1
+    for answer in "${options[@]}"; do
+      printf '  %s) %s\n' "$index" "$answer" >&2
+      index=$((index + 1))
+    done
+    read -r -p "Выберите вариант [$default]: " answer || die "Ввод прерван."
     answer=${answer:-$default}
-    case "${answer,,}" in
-      y|yes|д|да) return 0 ;;
-      n|no|н|нет) return 1 ;;
-      *) warn "Ответьте да или нет." ;;
-    esac
+    answer=$(trim "$answer")
+    if [[ "$answer" =~ ^[0-9]+$ ]] \
+       && ((10#$answer >= 1 && 10#$answer <= ${#options[@]})); then
+      printf '%s' "$((10#$answer))"
+      return 0
+    fi
+    warn "Введите номер одного из предложенных вариантов."
   done
+}
+
+ask_yes_no() {
+  local prompt=$1 default=${2:-n} default_number choice
+  [[ "$default" == y ]] && default_number=1 || default_number=2
+  choice=$(ask_menu "$prompt" "$default_number" "Да" "Нет")
+  [[ "$choice" == 1 ]]
+}
+
+ask_protocol() {
+  local choice
+  choice=$(ask_menu "Какой протокол разрешить?" 3 \
+    "TCP" "UDP" "TCP и UDP")
+  case "$choice" in
+    1) printf 'tcp' ;;
+    2) printf 'udp' ;;
+    3) printf 'both' ;;
+  esac
 }
 
 trim() {
@@ -127,7 +154,7 @@ validate_port() {
 }
 
 normalize_ports() {
-  local raw=$1 item start end
+  local raw=$1 item start end normalized seen=$'\n'
   local -a out=() items=()
   raw=${raw//;/,}
   raw=${raw// /,}
@@ -139,11 +166,15 @@ normalize_ports() {
       start=${BASH_REMATCH[1]}; end=${BASH_REMATCH[2]}
       validate_port "$start" && validate_port "$end" && ((10#$start <= 10#$end)) \
         || die "Некорректный диапазон портов: $item"
-      out+=("$((10#$start))-$((10#$end))")
+      normalized="$((10#$start))-$((10#$end))"
     elif validate_port "$item"; then
-      out+=("$((10#$item))")
+      normalized="$((10#$item))"
     else
       die "Некорректный порт: $item"
+    fi
+    if [[ "$seen" != *$'\n'"$normalized"$'\n'* ]]; then
+      out+=("$normalized")
+      seen+="${normalized}"$'\n'
     fi
   done
   local joined=""
@@ -275,10 +306,10 @@ prepare_extra_workfile() {
 show_extra_rules() {
   local file=${1:-$EXTRA_RULES_FILE}
   if [[ ! -f "$file" ]] || ! grep -qE '^[[:space:]]*[^#[:space:]]' "$file"; then
-    info "Постоянных дополнительных правил нет."
+    info "Пока нет ни одного разрешения для отдельных IP-адресов."
     return 0
   fi
-  printf 'Протокол | Порты | Источники | Метка\n'
+  printf 'Протокол | Порты | С каких IP разрешено | Название\n'
   grep -vE '^[[:space:]]*(#|$)' "$file" | sed 's/|/ | /g'
 }
 
@@ -685,7 +716,7 @@ cmd_status() {
   ss -H -lntp 2>/dev/null || true
   printf '\nDocker network modes:\n'
   show_docker_networks
-  printf '\nПостоянные дополнительные правила:\n'
+  printf '\nРазрешения для отдельных IP-адресов:\n'
   show_extra_rules
 }
 
@@ -727,7 +758,7 @@ cmd_apply() {
   node_ips=$(node_ip_addresses)
 
   info "Будет изменена только таблица nftables '$TABLE_FAMILY $TABLE_NAME'."
-  local panel_raw panel_port ssh_port ssh_raw tcp_raw ipv6_enabled
+  local panel_raw panel_port ssh_port ssh_raw tcp_extra_raw tcp_raw ipv6_enabled
   printf '\nНужен публичный ИСХОДЯЩИЙ IP сервера Remnawave Panel.\n'
   printf 'Это адрес, С КОТОРОГО панель подключается к Node API этой ноды.\n'
   printf 'НЕ вводите IP настраиваемой ноды.\n'
@@ -737,14 +768,16 @@ cmd_apply() {
   ssh_port=$(ask "TCP-порт SSH" "$ssh_default")
   [[ -n "$current_ssh_ip" ]] && info "Текущий SSH-клиент: $current_ssh_ip. Если этот IP постоянный, безопаснее указать его вместо значения по умолчанию."
   ssh_raw=$(ask "IP, которым разрешён SSH (0.0.0.0 = доступ всем)" "0.0.0.0")
-  tcp_raw=$(ask "Публичные TCP-порты (пусто = ни одного)" "80,443")
-  if ask_yes_no "Открывать указанные публичные порты также по IPv6?" "$ipv6_default"; then ipv6_enabled=yes; else ipv6_enabled=no; fi
+  tcp_extra_raw=$(ask "Введите дополнительные публичные TCP-порты. Порты 80 и 443 уже включены; если другие не нужны, нажмите Enter" "")
+  if ask_yes_no "Разрешить публичные TCP-порты также через IPv6?" "$ipv6_default"; then ipv6_enabled=yes; else ipv6_enabled=no; fi
 
   panel_raw=$(clean_ip_input "$panel_raw")
   ssh_raw=$(clean_ip_input "$ssh_raw")
   panel_port=$(clean_port_input "$panel_port")
   ssh_port=$(clean_port_input "$ssh_port")
-  tcp_raw=$(clean_port_input "$tcp_raw")
+  tcp_extra_raw=$(clean_port_input "$tcp_extra_raw")
+  tcp_raw="80,443"
+  [[ -n $(trim "$tcp_extra_raw") ]] && tcp_raw+=",${tcp_extra_raw}"
 
   [[ -n $(trim "$panel_raw") ]] || die "IP панели обязателен. Домен здесь использовать нельзя."
   [[ -n $(trim "$panel_port") ]] || die "Порт Remnawave Node API обязателен."
@@ -779,23 +812,22 @@ cmd_apply() {
   extra_work=$(mktemp)
   trap 'rm -f "${generated:-}" "${extra_work:-}"' EXIT
   prepare_extra_workfile "$extra_work"
-  printf '\nСохранённые дополнительные разрешения (они не потеряются при apply):\n'
+  printf '\nРазрешения для отдельных IP-адресов:\n'
   show_extra_rules "$extra_work"
   if grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work" \
-     && ! ask_yes_no "Сохранить все эти дополнительные правила?" y; then
-    reset_word=$(ask "Для удаления всех дополнительных правил введите RESET" "")
+     && ! ask_yes_no "Оставить эти разрешения включёнными?" y; then
+    reset_word=$(ask "Чтобы удалить все эти разрешения, введите RESET" "")
     [[ "$reset_word" == RESET ]] || die "Сброс не подтверждён; ничего не изменено."
     write_extra_header "$extra_work"
   fi
-  while ask_yes_no "Добавить постоянное TCP/UDP-разрешение по IP?" n; do
-    protocol=$(ask "Протокол: tcp, udp или both" "both")
-    protocol=$(LC_ALL=C printf '%s' "$protocol" | tr '[:upper:]' '[:lower:]')
-    extra_ports=$(ask "Порты/диапазоны" "")
-    extra_sources=$(ask "Разрешённые IP или CIDR (0.0.0.0/0 и ::/0 запрещены)" "")
-    extra_label=$(ask "Короткая метка" "extra-service")
+  while ask_yes_no "Нужно открыть отдельный порт только для выбранного IP-адреса?" n; do
+    protocol=$(ask_protocol)
+    extra_ports=$(ask "Введите порт, который нужно открыть. Например, 9999" "")
+    extra_sources=$(ask "Введите IP-адрес, с которого можно подключаться. Например, 195.209.211.140" "")
+    extra_label=$(ask "Введите понятное название для этого разрешения" "Дополнительный доступ")
     append_extra_rule "$extra_work" "$protocol" "$extra_ports" "$extra_sources" "$extra_label"
     validate_extra_config "$extra_work" || die "Не удалось сформировать дополнительное правило."
-    ok "Дополнительное правило добавлено в ожидающую конфигурацию."
+    ok "Разрешение добавлено. Оно будет показано в итоговой конфигурации ниже."
   done
   validate_extra_config "$extra_work" || die "Реестр дополнительных правил некорректен; ничего не изменено."
 
@@ -811,7 +843,7 @@ cmd_apply() {
 
   printf '\nИтоговая конфигурация:\n'
   sed -n '1,240p' "$generated"
-  printf '\nПостоянные дополнительные правила:\n'
+  printf '\nРазрешения для отдельных IP-адресов:\n'
   show_extra_rules "$extra_work"
   printf '\nСейчас слушают:\n'
   ss -H -lntp 2>/dev/null || true
@@ -864,6 +896,7 @@ cmd_self_test() {
   ! validate_port 0
   ! validate_port 65536
   [[ $(normalize_ports '22, 80;443,1000-1002') == '22, 80, 443, 1000-1002' ]]
+  [[ $(normalize_ports '80,443,80,443') == '80, 443' ]]
   [[ $(normalize_ips '192.0.2.10, 198.51.100.7' 4) == '192.0.2.10/32, 198.51.100.7/32' ]]
   [[ $(normalize_ips '2001:db8::1' 6) == '2001:db8::1/128' ]]
   [[ $(normalize_ips '0.0.0.0' 4) == '0.0.0.0/0' ]]

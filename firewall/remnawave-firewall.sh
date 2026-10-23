@@ -900,7 +900,7 @@ cmd_apply() {
       ssh_raw="0.0.0.0"
       tcp_raw="80,443"
       ipv6_enabled=yes
-      info "Автоматические безопасные значения: SSH $ssh_port; публичные TCP 80,443; IPv4 и IPv6."
+      info "Автоматические стандартные значения: SSH $ssh_port; публичные TCP 80,443; IPv4 и IPv6."
       info "Для нестандартной схемы используйте: apply --advanced"
     fi
   fi

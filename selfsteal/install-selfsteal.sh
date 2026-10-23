@@ -7,7 +7,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly WEB_ROOT="/var/www/remnawave-selfsteal"
 readonly STATE_FILE="/etc/remnawave-selfsteal.conf"
@@ -35,7 +35,8 @@ usage() {
   sudo bash install-selfsteal.sh [--domain ИМЯ] [--expected-ip IPv4] [--force]
   bash install-selfsteal.sh self-test
 
-Обычный запуск спрашивает только домен. Публичный IPv4 определяется автоматически.
+Обычный запуск спрашивает домен. Публичный IPv4 определяется автоматически,
+а если это не удалось - скрипт попросит ввести его вручную.
 
 Опции:
   --domain ИМЯ          Домен Reality/Selfsteal, например brr1.example.com.
@@ -276,7 +277,12 @@ main() {
   validate_domain "$DOMAIN" || die "Некорректный домен: $DOMAIN"
 
   if [[ -z "$EXPECTED_IP" ]]; then
-    EXPECTED_IP=$(detect_public_ipv4) || die "Не удалось определить публичный IPv4. Запустите с --expected-ip АДРЕС."
+    if EXPECTED_IP=$(detect_public_ipv4); then
+      ok "Публичный IPv4 определён автоматически: $EXPECTED_IP"
+    else
+      warn "Не удалось определить публичный IPv4 автоматически."
+      read -r -p "Публичный IPv4 этой ноды: " EXPECTED_IP
+    fi
   fi
   validate_ipv4 "$EXPECTED_IP" || die "Некорректный публичный IPv4: $EXPECTED_IP"
 

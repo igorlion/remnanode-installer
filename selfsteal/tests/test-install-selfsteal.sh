@@ -10,6 +10,7 @@ bash "$script" self-test
 grep -Fq 'disable_tlsalpn_challenge' "$script"
 grep -Fq 'protocols h1 h2' "$script"
 grep -Fq 'bind 127.0.0.1' "$script"
+grep -Fq 'caddy fmt --overwrite' "$script"
 ! grep -Fq 'systemctl stop remnanode' "$script"
 ! grep -Fq 'dport 443' "$script"
 

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly WEB_ROOT="/var/www/remnawave-selfsteal"
 readonly STATE_FILE="/etc/remnawave-selfsteal.conf"
@@ -334,6 +334,7 @@ main() {
 
   write_page
   write_caddyfile "$WORKDIR/Caddyfile"
+  caddy fmt --overwrite "$WORKDIR/Caddyfile"
   caddy validate --config "$WORKDIR/Caddyfile" --adapter caddyfile
   install -m 0644 "$WORKDIR/Caddyfile" "$CADDYFILE"
 
@@ -350,6 +351,7 @@ main() {
     if curl -fsS --connect-timeout 5 --max-time 10 \
       --resolve "${DOMAIN}:8443:127.0.0.1" \
       "https://${DOMAIN}:8443/" \
+      2>/dev/null \
       | grep -Fq 'All systems operational'; then
       cert_ok=1
       break

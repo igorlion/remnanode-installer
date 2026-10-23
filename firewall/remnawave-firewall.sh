@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.2.2"
+readonly VERSION="1.3.0"
 readonly TABLE_FAMILY="inet"
 readonly TABLE_NAME="remnawave_guard"
 readonly INSTALL_PATH="/usr/local/sbin/remnawave-firewall"
@@ -26,6 +26,8 @@ DRY_RUN=0
 FORCE_CONFLICTS=0
 ROLLBACK_SECONDS=180
 ASSUME_YES=0
+ADVANCED=0
+SHOW_RULES=0
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -35,7 +37,7 @@ die()  { printf '\033[1;31m[ERR ]\033[0m %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Использование:
-  sudo bash remnawave-firewall.sh apply [--dry-run] [--rollback-seconds N]
+  sudo bash remnawave-firewall.sh apply [--rollback-seconds N]
   sudo remnawave-firewall status
   sudo remnawave-firewall test
   sudo remnawave-firewall confirm
@@ -53,7 +55,9 @@ usage() {
   self-test   Локальные тесты парсеров/генератора; firewall не меняется.
 
 Опции apply:
-  --dry-run              Только сформировать и проверить конфигурацию.
+  --dry-run              Только сформировать и проверить конфигурацию (не нужен перед обычным apply).
+  --advanced             Задать SSH, публичные порты, IPv6 и несколько адресных правил вручную.
+  --show-rules           Показать полный nftables-конфиг перед применением.
   --rollback-seconds N   Окно автоматического отката, 60..1800 (по умолчанию 180).
   --force-conflicts      Разрешить продолжение при найденных конфликтах.
   --yes                  Не задавать дополнительный вопрос о конфликтах.
@@ -402,6 +406,91 @@ PY
 
 detect_ipv6_default() {
   ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' && printf 'y' || printf 'n'
+}
+
+detect_node_port() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker inspect remnanode --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | sed -n 's/^NODE_PORT=//p' \
+    | head -n1
+}
+
+load_saved_configuration() {
+  local source=${1:-$RULES_FILE}
+  local -a values=()
+  [[ -f "$source" ]] || return 1
+  mapfile -t values < <(python3 - "$source" <<'PY'
+import ipaddress
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+
+def sources_for(label):
+    result = []
+    for line in text.splitlines():
+        if f'comment "{label}' not in line:
+            continue
+        match = re.search(r'ip6? saddr \{ ([^}]+) \}', line)
+        if not match:
+            continue
+        for raw in match.group(1).split(','):
+            network = ipaddress.ip_network(raw.strip(), strict=False)
+            if network.prefixlen == 0:
+                result.append("0.0.0.0" if network.version == 4 else "::")
+            elif network.num_addresses == 1:
+                result.append(str(network.network_address))
+            else:
+                result.append(str(network))
+    return ", ".join(dict.fromkeys(result))
+
+def port_for(label):
+    for line in text.splitlines():
+        if f'comment "{label}' in line:
+            match = re.search(r'tcp dport ([0-9]+)', line)
+            if match:
+                return match.group(1)
+    return ""
+
+panel = sources_for("Remnawave panel")
+panel_port = port_for("Remnawave panel")
+ssh = sources_for("SSH")
+ssh_port = port_for("SSH")
+public_ports = ""
+ipv6 = "no"
+for line in text.splitlines():
+    if 'comment "public TCP ' not in line:
+        continue
+    match = re.search(r'tcp dport \{ ([^}]+) \}', line)
+    if match:
+        public_ports = match.group(1).strip()
+    ipv6 = "yes" if "IPv4+IPv6" in line else "no"
+    break
+
+values = (panel, panel_port, ssh, ssh_port, public_ports, ipv6)
+if not all(values):
+    raise SystemExit(1)
+print("\n".join(values))
+PY
+  ) || return 1
+  ((${#values[@]} == 6)) || return 1
+  SAVED_PANEL_RAW=${values[0]}
+  SAVED_PANEL_PORT=${values[1]}
+  SAVED_SSH_RAW=${values[2]}
+  SAVED_SSH_PORT=${values[3]}
+  SAVED_TCP_RAW=${values[4]}
+  SAVED_IPV6_ENABLED=${values[5]}
+}
+
+show_human_summary() {
+  local panel_raw=$1 panel_port=$2 ssh_raw=$3 ssh_port=$4 tcp_ports=$5 ipv6_enabled=$6 extra_file=$7
+  printf '\nИтог перед применением:\n'
+  printf '  Панель Remnawave:   %s -> TCP/%s\n' "$panel_raw" "$panel_port"
+  printf '  SSH:                TCP/%s, источник: %s\n' "$ssh_port" "$ssh_raw"
+  printf '  Публичные TCP:      %s (%s)\n' "$tcp_ports" "$([[ "$ipv6_enabled" == yes ]] && printf 'IPv4 и IPv6' || printf 'только IPv4')"
+  printf '  Остальное входящее: блокировать\n'
+  printf '\n  Ограниченные разрешения:\n'
+  show_extra_rules "$extra_file"
 }
 
 write_rules() {
@@ -753,7 +842,7 @@ cmd_apply() {
   fi
   [[ "$os_id" == "ubuntu" ]] || warn "Скрипт рассчитан на Ubuntu; обнаружено: $os_name."
 
-  local ssh_default current_ssh_ip ipv6_default node_ips
+  local ssh_default current_ssh_ip ipv6_default node_ips detected_node_port use_saved=0
   ssh_default=$(current_ssh_port); ssh_default=${ssh_default:-22}
   current_ssh_ip=$(current_ssh_source)
   ipv6_default=$(detect_ipv6_default)
@@ -761,35 +850,66 @@ cmd_apply() {
 
   info "Будет изменена только таблица nftables '$TABLE_FAMILY $TABLE_NAME'."
   local panel_raw panel_port ssh_port ssh_raw tcp_extra_raw tcp_raw ipv6_enabled ipv6_choice
-  printf '\nНужен публичный ИСХОДЯЩИЙ IP сервера Remnawave Panel.\n'
-  printf 'Это адрес, С КОТОРОГО панель подключается к Node API этой ноды.\n'
-  printf 'НЕ вводите IP настраиваемой ноды.\n'
-  [[ -n "$node_ips" ]] && printf 'Обнаруженные IP этой ноды: %s\n\n' "${node_ips//$'\n'/, }"
-  panel_raw=$(ask "Исходящий IP сервера панели (не IP ноды; несколько IP — через запятую)" "")
-  panel_port=$(ask "TCP-порт Remnawave Node API (обязательно)" "")
-  ssh_port=$(ask "TCP-порт SSH" "$ssh_default")
-  [[ -n "$current_ssh_ip" ]] && info "Текущий SSH-клиент: $current_ssh_ip. Если этот IP постоянный, безопаснее указать его вместо значения по умолчанию."
-  ssh_raw=$(ask "IP, которым разрешён SSH (0.0.0.0 = доступ всем)" "0.0.0.0")
-  printf '\nПубличные TCP-порты — доступны всему интернету, без ограничения по IP.\n'
-  printf 'Порты 80 и 443 уже включены автоматически.\n'
-  printf 'Не вводите здесь порт моста, если он должен быть доступен только с другой ноды.\n'
-  tcp_extra_raw=$(ask "Другие публичные TCP-порты (если не нужны — просто нажмите Enter)" "")
+  if (( ADVANCED == 0 )) && load_saved_configuration; then
+    printf '\nНайдена уже сохранённая рабочая конфигурация.\n'
+    printf '  Панель: %s -> TCP/%s\n' "$SAVED_PANEL_RAW" "$SAVED_PANEL_PORT"
+    printf '  SSH:    %s -> TCP/%s\n' "$SAVED_SSH_RAW" "$SAVED_SSH_PORT"
+    printf '  Публичные TCP: %s\n' "$SAVED_TCP_RAW"
+    if ask_yes_no "Применить её повторно без ввода всех данных?" y; then
+      panel_raw=$SAVED_PANEL_RAW
+      panel_port=$SAVED_PANEL_PORT
+      ssh_raw=$SAVED_SSH_RAW
+      ssh_port=$SAVED_SSH_PORT
+      tcp_raw=$SAVED_TCP_RAW
+      ipv6_enabled=$SAVED_IPV6_ENABLED
+      use_saved=1
+    fi
+  fi
 
-  [[ "$ipv6_default" == y ]] && ipv6_choice=1 || ipv6_choice=2
-  ipv6_choice=$(ask_menu \
-    "Как открыть публичные TCP-порты 80, 443 и указанные выше? UDP этот выбор не открывает." \
-    "$ipv6_choice" \
-    "По IPv4 и IPv6 — TCP-порты будут доступны через обе сети" \
-    "Только по IPv4 — через IPv6 эти TCP-порты будут закрыты")
-  [[ "$ipv6_choice" == 1 ]] && ipv6_enabled=yes || ipv6_enabled=no
+  if (( use_saved == 0 )); then
+    printf '\nНужен только публичный ИСХОДЯЩИЙ IP сервера Remnawave Panel.\n'
+    printf 'Это адрес, С КОТОРОГО панель подключается к Node API этой ноды.\n'
+    printf 'НЕ вводите IP настраиваемой ноды.\n'
+    [[ -n "$node_ips" ]] && printf 'IP этой ноды: %s\n\n' "${node_ips//$'\n'/, }"
+    panel_raw=$(ask "Исходящий IP панели" "")
+    detected_node_port=$(detect_node_port)
+    if validate_port "${detected_node_port:-}"; then
+      panel_port=$detected_node_port
+      ok "Порт Remnawave Node найден автоматически: $panel_port"
+    else
+      panel_port=$(ask "Порт Remnawave Node API" "")
+    fi
+
+    if (( ADVANCED )); then
+      ssh_port=$(ask "TCP-порт SSH" "$ssh_default")
+      [[ -n "$current_ssh_ip" ]] && info "Текущий SSH-клиент: $current_ssh_ip."
+      ssh_raw=$(ask "IP, которым разрешён SSH (0.0.0.0 = доступ всем)" "0.0.0.0")
+      printf '\nПорты 80 и 443 уже включены автоматически.\n'
+      tcp_extra_raw=$(ask "Другие публичные TCP-порты (если не нужны — Enter)" "")
+      tcp_raw="80,443"
+      [[ -n $(trim "$tcp_extra_raw") ]] && tcp_raw+=",${tcp_extra_raw}"
+      [[ "$ipv6_default" == y ]] && ipv6_choice=1 || ipv6_choice=2
+      ipv6_choice=$(ask_menu \
+        "Через какие сети открыть публичные TCP-порты?" \
+        "$ipv6_choice" \
+        "IPv4 и IPv6" \
+        "Только IPv4")
+      [[ "$ipv6_choice" == 1 ]] && ipv6_enabled=yes || ipv6_enabled=no
+    else
+      ssh_port=$ssh_default
+      ssh_raw="0.0.0.0"
+      tcp_raw="80,443"
+      ipv6_enabled=yes
+      info "Автоматические безопасные значения: SSH $ssh_port; публичные TCP 80,443; IPv4 и IPv6."
+      info "Для нестандартной схемы используйте: apply --advanced"
+    fi
+  fi
 
   panel_raw=$(clean_ip_input "$panel_raw")
   ssh_raw=$(clean_ip_input "$ssh_raw")
   panel_port=$(clean_port_input "$panel_port")
   ssh_port=$(clean_port_input "$ssh_port")
-  tcp_extra_raw=$(clean_port_input "$tcp_extra_raw")
-  tcp_raw="80,443"
-  [[ -n $(trim "$tcp_extra_raw") ]] && tcp_raw+=",${tcp_extra_raw}"
+  tcp_raw=$(clean_port_input "$tcp_raw")
 
   [[ -n $(trim "$panel_raw") ]] || die "IP панели обязателен. Домен здесь использовать нельзя."
   [[ -n $(trim "$panel_port") ]] || die "Порт Remnawave Node API обязателен."
@@ -824,58 +944,54 @@ cmd_apply() {
   extra_work=$(mktemp)
   trap 'rm -f "${generated:-}" "${extra_work:-}"' EXIT
   prepare_extra_workfile "$extra_work"
-  printf '\nДоступ к порту этой ноды для RU-ноды:\n'
-  printf 'Текущая обычная нода принимает подключение, а RU-нода его инициирует.\n'
-  printf 'Укажите порт моста на этой ноде и публичный IP RU-ноды, откуда приходит подключение.\n'
-  printf 'Порт будет доступен только с указанной RU-ноды и закрыт для остального интернета.\n'
-  printf 'Пример: TCP и UDP, порт 9999, публичный IP RU-ноды 198.51.100.20.\n'
-  printf 'Адрес 198.51.100.20 учебный — замените его реальным публичным IP своей RU-ноды.\n'
-  printf 'Добавленные здесь разрешения сохраняются и автоматически используются при следующих применениях правил.\n\n'
-  show_extra_rules "$extra_work"
-  if grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work" \
-     && ! ask_yes_no "Оставить эти разрешения включёнными?" y; then
-    reset_word=$(ask "Чтобы удалить все эти разрешения, введите RESET" "")
-    [[ "$reset_word" == RESET ]] || die "Сброс не подтверждён; ничего не изменено."
-    write_extra_header "$extra_work"
+  if (( use_saved )); then
+    info "Ограниченные разрешения также взяты из сохранённой конфигурации."
+  elif (( ADVANCED )); then
+    printf '\nДополнительные порты, доступные только с указанных IP:\n'
+    show_extra_rules "$extra_work"
+    if grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work" \
+       && ! ask_yes_no "Оставить эти разрешения включёнными?" y; then
+      reset_word=$(ask "Чтобы удалить все эти разрешения, введите RESET" "")
+      [[ "$reset_word" == RESET ]] || die "Сброс не подтверждён; ничего не изменено."
+      write_extra_header "$extra_work"
+    fi
+    while [[ $(ask_menu \
+      "Добавить ещё одно ограниченное разрешение?" 2 \
+      "Да" \
+      "Нет") == 1 ]]; do
+      protocol=$(ask_protocol)
+      extra_ports=$(ask "Порт или диапазон портов" "")
+      extra_sources=$(ask "Разрешённый публичный IP источника" "")
+      extra_label=$(ask "Понятное название" "Дополнительное правило")
+      append_extra_rule "$extra_work" "$protocol" "$extra_ports" "$extra_sources" "$extra_label"
+      validate_extra_config "$extra_work" || die "Не удалось сформировать дополнительное правило."
+    done
+  elif grep -qE '^[[:space:]]*[^#[:space:]]' "$extra_work"; then
+    info "Сохранённые ограничения оставлены без изменений. Для редактирования используйте apply --advanced."
+  elif ask_yes_no "Эта нода будет принимать подключение от RU-моста?" n; then
+    extra_sources=$(ask "Публичный IP RU-моста" "")
+    extra_ports=$(ask "Порт моста на этой ноде" "9999")
+    append_extra_rule "$extra_work" both "$extra_ports" "$extra_sources" "RU-мост"
+    ok "TCP и UDP порта $extra_ports будут доступны только с $extra_sources."
   fi
-  while [[ $(ask_menu \
-    "Разрешить RU-ноде подключаться к порту на этой ноде?" 2 \
-    "Да — указать порт на этой ноде и публичный IP RU-ноды" \
-    "Нет — больше ограниченных разрешений добавлять не нужно") == 1 ]]; do
-    protocol=$(ask_protocol)
-    extra_ports=$(ask "Порт или диапазон портов (пример: 9999)" "")
-    extra_sources=$(ask "Публичный IP RU-ноды, откуда приходит подключение (пример: 198.51.100.20)" "")
-    extra_label=$(ask "Название разрешения, чтобы потом его узнать (пример: RU-нода)" "RU-нода")
-    append_extra_rule "$extra_work" "$protocol" "$extra_ports" "$extra_sources" "$extra_label"
-    validate_extra_config "$extra_work" || die "Не удалось сформировать дополнительное правило."
-    ok "Разрешение добавлено. Оно будет показано в итоговой конфигурации ниже."
-  done
   validate_extra_config "$extra_work" || die "Реестр дополнительных правил некорректен; ничего не изменено."
-
-  printf '\nПроверка критичных адресов:\n'
-  printf '  IP панели:       %s\n' "$panel_raw"
-  printf '  IP этой ноды:    %s\n' "${node_ips//$'\n'/, }"
-  printf '  Node API:        TCP/%s\n' "$panel_port"
 
   check_conflicts
   write_rules "$generated" "$ssh_port" "$ssh_v4" "$ssh_v6" "$panel_port" "$panel_v4" "$panel_v6" "$tcp_ports" "$ipv6_enabled" "$extra_work"
   nft -c -f "$generated" || die "nftables отклонил конфигурацию; ничего не применено."
   ok "nft -c: конфигурация синтаксически корректна."
 
-  printf '\nИтоговая конфигурация:\n'
-  sed -n '1,240p' "$generated"
-  printf '\nРазрешения для отдельных IP-адресов:\n'
-  show_extra_rules "$extra_work"
-  printf '\nСейчас слушают:\n'
-  ss -H -lntp 2>/dev/null || true
-  printf '\nDocker network modes:\n'
-  show_docker_networks
+  show_human_summary "$panel_raw" "$panel_port" "$ssh_raw" "$ssh_port" "$tcp_ports" "$ipv6_enabled" "$extra_work"
+  if (( SHOW_RULES )); then
+    printf '\nПолный nftables-конфиг:\n'
+    sed -n '1,240p' "$generated"
+  fi
 
   if (( DRY_RUN )); then
     ok "Dry run завершён: firewall, systemd и постоянные файлы не изменены."
     return 0
   fi
-  ask_yes_no "Применить правила со страховочным откатом через ${ROLLBACK_SECONDS} секунд?" n \
+  ask_yes_no "Применить эти правила со страховочным откатом через ${ROLLBACK_SECONDS} секунд?" y \
     || die "Отменено пользователем; ничего не применено."
 
   install_self
@@ -949,6 +1065,13 @@ cmd_self_test() {
   grep -Fq 'meta nfproto ipv4 tcp dport { 80, 443 }' "$temp"
   grep -Fq 'ip saddr { 198.51.100.20/32 } tcp dport { 9999 }' "$temp"
   grep -Fq 'ip saddr { 198.51.100.20/32 } udp dport { 9999 }' "$temp"
+  load_saved_configuration "$temp"
+  [[ "$SAVED_PANEL_RAW" == '192.0.2.10' ]]
+  [[ "$SAVED_PANEL_PORT" == '38471' ]]
+  [[ "$SAVED_SSH_RAW" == '203.0.113.7' ]]
+  [[ "$SAVED_SSH_PORT" == '22' ]]
+  [[ "$SAVED_TCP_RAW" == '80, 443' ]]
+  [[ "$SAVED_IPV6_ENABLED" == 'no' ]]
   write_rules "$temp_second" 22 '203.0.113.7/32' '' 38471 '192.0.2.10/32' '' '80, 443' no "$extras"
   cmp -s "$temp" "$temp_second"
   ! grep -Fq 'set public_tcp' "$temp"
@@ -967,6 +1090,8 @@ main() {
   while (($#)); do
     case "$1" in
       --dry-run) DRY_RUN=1 ;;
+      --advanced) ADVANCED=1 ;;
+      --show-rules) SHOW_RULES=1 ;;
       --force-conflicts) FORCE_CONFLICTS=1 ;;
       --yes) ASSUME_YES=1 ;;
       --rollback-seconds)
@@ -1004,3 +1129,4 @@ if [[ ${1:-} == rollback-auto ]]; then
 else
   main "$@"
 fi
+

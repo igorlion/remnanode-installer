@@ -99,16 +99,17 @@ docker compose logs --tail=100 -t
 
 ## Firewall
 
-Для Ubuntu подготовлен отдельный интерактивный nftables-firewall. Он запрашивает IP панели, порт Node API, SSH-доступ, публичные TCP-порты и IPv6; перед применением выполняет dry run и ставит автоматический SSH-safe rollback.
+Для Ubuntu подготовлен отдельный интерактивный nftables-firewall. В обычном режиме он спрашивает только исходящий IP панели и при необходимости данные RU-моста. Порт Node API определяется из контейнера, рабочие значения повторно не запрашиваются, а после применения ставится автоматический SSH-safe rollback.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/igorlion/remnanode-installer/main/firewall/remnawave-firewall.sh -o /tmp/remnawave-firewall.sh
 chmod +x /tmp/remnawave-firewall.sh
-sudo /tmp/remnawave-firewall.sh apply --dry-run
-sudo /tmp/remnawave-firewall.sh apply --rollback-seconds 180
+sudo /tmp/remnawave-firewall.sh apply
 ```
 
 После применения не закрывай первую SSH-сессию: открой второе новое соединение и только после проверки введи `CONFIRM`. Полная инструкция: [firewall/README.md](firewall/README.md).
+
+Для нестандартного SSH-доступа, других публичных портов, ручного IPv6 или нескольких адресных правил используй `apply --advanced`.
 
 ## Полезные команды
 
@@ -144,3 +145,4 @@ systemctl status remnawave-zapret-update.timer
 ## Лицензия
 
 [MIT](LICENSE)
+

@@ -111,6 +111,17 @@ sudo /tmp/remnawave-firewall.sh apply
 
 Для нестандартного SSH-доступа, других публичных портов, ручного IPv6 или нескольких адресных правил используй `apply --advanced`.
 
+## Selfsteal для Reality
+
+Отдельный скрипт устанавливает Caddy как локальную HTTPS-цель `127.0.0.1:8443`. Сертификат выпускается через публичный TCP `80`, поэтому Xray может всё время продолжать слушать TCP `443`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/igorlion/remnanode-installer/main/selfsteal/install-selfsteal.sh -o /tmp/install-selfsteal.sh
+sudo bash /tmp/install-selfsteal.sh
+```
+
+После установки укажи в Reality `target: 127.0.0.1:8443`, а домен Selfsteal используй в `serverNames` и клиентском SNI. Полная инструкция: [selfsteal/README.md](selfsteal/README.md).
+
 ## Полезные команды
 
 ```bash

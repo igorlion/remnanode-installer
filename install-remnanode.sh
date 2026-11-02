@@ -6,6 +6,7 @@ LOGDIR=/var/log/remnanode
 ASSETDIR=/opt/remnawave/xray/share
 ZAPRET_URL=https://github.com/kutovoys/ru_gov_zapret/releases/latest/download/zapret.dat
 WITH_ZAPRET=false
+COMPOSE_INPUT=
 STAGE=
 
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
@@ -14,19 +15,24 @@ usage() {
 Установка Remnawave Node на чистый Ubuntu/Debian с systemd.
   install-remnanode.sh                Без zapret (по умолчанию)
   install-remnanode.sh --with-zapret  Однократная загрузка zapret, RAM >= 2 GiB
+  install-remnanode.sh --compose-file PATH  Прочитать compose из файла
   install-remnanode.sh --help        Эта справка
 Таймеры обновления и автоматические перезапуски zapret не создаются.
 Существующая установка не изменяется. Скрипт не предназначен для миграции.
 HELP
 }
 parse_args() {
-    case "${1:-}" in
-        '') ;;
-        --with-zapret) WITH_ZAPRET=true; shift ;;
-        --help|-h) usage; exit 0 ;;
-        *) die "Неизвестный аргумент: $1" ;;
-    esac
-    (( $# == 0 )) || die 'Лишние аргументы.'
+    while (( $# )); do
+        case "$1" in
+            --with-zapret) WITH_ZAPRET=true; shift ;;
+            --compose-file)
+                (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || die 'Укажи путь после --compose-file.'
+                [[ -z "$COMPOSE_INPUT" ]] || die '--compose-file указан повторно.'
+                COMPOSE_INPUT=$2; shift 2 ;;
+            --help|-h) usage; exit 0 ;;
+            *) die "Неизвестный аргумент: $1" ;;
+        esac
+    done
 }
 check_existing_install() {
     # Check BEFORE apt, systemctl or writes. Refuse partial/legacy installations too.
@@ -66,13 +72,14 @@ preflight() {
     fi
 }
 read_compose() {
-    echo 'Вставь docker-compose.yml из панели. Заверши отдельной строкой __END__.'
-    local line done=false
-    while IFS= read -r line; do
-        if [[ "$line" == __END__ ]]; then done=true; break; fi
-        printf '%s\n' "$line" >> "$STAGE/docker-compose.yml"
-    done </dev/tty
-    [[ "$done" == true && -s "$STAGE/docker-compose.yml" ]] || die 'Ввод compose не завершён или пуст.'
+    if [[ -n "$COMPOSE_INPUT" ]]; then
+        [[ -f "$COMPOSE_INPUT" && -r "$COMPOSE_INPUT" ]] || die 'Файл compose не найден или недоступен для чтения.'
+        cat -- "$COMPOSE_INPUT" > "$STAGE/docker-compose.yml"
+    else
+        echo 'Вставь docker-compose.yml целиком. Нажми Enter, затем Ctrl+D. Строка END не нужна.'
+        cat > "$STAGE/docker-compose.yml" </dev/tty
+    fi
+    [[ -s "$STAGE/docker-compose.yml" ]] || die 'Compose пуст.'
     if [[ "$WITH_ZAPRET" == false ]] && grep -qi zapret "$STAGE/docker-compose.yml"; then
         die 'В compose уже упомянут zapret. Для режима без zapret нужен чистый compose из панели.'
     fi

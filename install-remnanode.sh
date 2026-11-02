@@ -1,162 +1,155 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if (( EUID != 0 )); then
-    echo "ОШИБКА: запусти установщик от root (например, через sudo bash)." >&2
-    exit 1
-fi
+DIR=/opt/remnanode
+LOGDIR=/var/log/remnanode
+ASSETDIR=/opt/remnawave/xray/share
+ZAPRET_URL=https://github.com/kutovoys/ru_gov_zapret/releases/latest/download/zapret.dat
+WITH_ZAPRET=false
+STAGE=
 
-trap 'echo "ОШИБКА: установка прервана на строке $LINENO." >&2' ERR
-
-DIR="/opt/remnanode"
-LOGDIR="/var/log/remnanode"
-ASSETDIR="/opt/remnawave/xray/share"
-COMPOSE="$DIR/docker-compose.yml"
-OVERRIDE="$DIR/docker-compose.override.yml"
-ZAPRET_URL="https://github.com/kutovoys/ru_gov_zapret/releases/latest/download/zapret.dat"
-
-export DEBIAN_FRONTEND=noninteractive
-
-echo "[1/7] Установка Docker и необходимых пакетов..."
-apt-get update
-apt-get install -y ca-certificates curl logrotate
-
-if ! command -v docker >/dev/null 2>&1; then
-    curl -fsSL https://get.docker.com | sh
-fi
-
-if ! docker compose version >/dev/null 2>&1; then
-    apt-get install -y docker-compose-plugin
-fi
-
-systemctl enable --now docker
-install -d -m 755 "$DIR" "$LOGDIR" "$ASSETDIR"
-
-if [[ -f "$COMPOSE" ]]; then
-    echo "ОШИБКА: $COMPOSE уже существует. Ничего не перезаписываю."
-    exit 1
-fi
-
-echo "[2/7] Установка загрузчика и обновления zapret.dat..."
-
-cat > /usr/local/sbin/update-remnawave-zapret <<UPDATER
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-URL="$ZAPRET_URL"
-DEST="$ASSETDIR/zapret.dat"
-TMP="\$(mktemp "$ASSETDIR/.zapret.dat.XXXXXX")"
-trap 'rm -f "\$TMP"' EXIT
-
-curl --fail --location --silent --show-error \
-    --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 \
-    --output "\$TMP" "\$URL"
-
-SIZE="\$(stat -c '%s' "\$TMP")"
-if (( SIZE < 100000 )); then
-    echo "Ошибка: скачанный zapret.dat подозрительно маленький: \$SIZE байт." >&2
-    exit 1
-fi
-
-if [[ -f "\$DEST" ]] && cmp -s "\$TMP" "\$DEST"; then
-    echo "zapret.dat уже актуален."
-    exit 0
-fi
-
-chmod 644 "\$TMP"
-mv -f "\$TMP" "\$DEST"
-trap - EXIT
-echo "zapret.dat обновлён: \$SIZE байт."
-
-if docker ps --format '{{.Names}}' | grep -Fxq remnanode; then
-    cd "$DIR"
-    docker compose restart remnanode
-fi
-UPDATER
-
-chmod 755 /usr/local/sbin/update-remnawave-zapret
-/usr/local/sbin/update-remnawave-zapret
-
-cat > /etc/systemd/system/remnawave-zapret-update.service <<'SERVICE'
-[Unit]
-Description=Update Remnawave zapret.dat
-Wants=network-online.target
-After=network-online.target docker.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/update-remnawave-zapret
-SERVICE
-
-cat > /etc/systemd/system/remnawave-zapret-update.timer <<'TIMER'
-[Unit]
-Description=Daily update of Remnawave zapret.dat
-
-[Timer]
-OnCalendar=*-*-* 04:17:00
-RandomizedDelaySec=30m
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-TIMER
-
-systemctl daemon-reload
-systemctl enable --now remnawave-zapret-update.timer
-
-TMP_COMPOSE="$(mktemp)"
-trap 'rm -f "$TMP_COMPOSE"' EXIT
-
-echo
-echo "======================================================"
-echo "Скопируй docker-compose.yml из панели Remnawave"
-echo "и вставь его сюда целиком."
-echo
-echo "После compose на новой строке напиши: __END__"
-echo "======================================================"
-echo
-
-COMPOSE_DONE=false
-while IFS= read -r line; do
-    if [[ "$line" == "__END__" ]]; then
-        COMPOSE_DONE=true
-        break
+die() { echo "ОШИБКА: $*" >&2; exit 1; }
+usage() {
+    cat <<'HELP'
+Установка Remnawave Node на чистый Ubuntu/Debian с systemd.
+  install-remnanode.sh                Без zapret (по умолчанию)
+  install-remnanode.sh --with-zapret  Однократная загрузка zapret, RAM >= 2 GiB
+  install-remnanode.sh --help        Эта справка
+Таймеры обновления и автоматические перезапуски zapret не создаются.
+Существующая установка не изменяется. Скрипт не предназначен для миграции.
+HELP
+}
+parse_args() {
+    case "${1:-}" in
+        '') ;;
+        --with-zapret) WITH_ZAPRET=true; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) die "Неизвестный аргумент: $1" ;;
+    esac
+    (( $# == 0 )) || die 'Лишние аргументы.'
+}
+check_existing_install() {
+    # Check BEFORE apt, systemctl or writes. Refuse partial/legacy installations too.
+    local path
+    for path in "$DIR" "$ASSETDIR" "$LOGDIR" /etc/logrotate.d/remnanode \
+        /usr/local/sbin/update-remnawave-zapret \
+        /etc/systemd/system/remnawave-zapret-update.service \
+        /etc/systemd/system/remnawave-zapret-update.timer; do
+        [[ ! -e "$path" && ! -L "$path" ]] || die "Найдена существующая установка: $path. Требуется отдельная проверка/миграция."
+    done
+    if command -v docker >/dev/null 2>&1; then
+        local names
+        names=$(docker ps -a --format '{{.Names}}' 2>/dev/null) || die 'Docker недоступен; сначала проверь существующую установку.'
+        if grep -Fxq remnanode <<< "$names"; then
+            die 'Контейнер remnanode уже существует. Ничего не изменено.'
+        fi
     fi
-    printf '%s\n' "$line" >> "$TMP_COMPOSE"
-done </dev/tty
-
-if [[ "$COMPOSE_DONE" != true ]]; then
-    echo "ОШИБКА: ввод прерван до строки __END__." >&2
-    exit 1
-fi
-
-if [[ ! -s "$TMP_COMPOSE" ]]; then
-    echo "ОШИБКА: compose получился пустым."
-    exit 1
-fi
-
-if ! grep -Eq 'SECRET_KEY[=:]' "$TMP_COMPOSE"; then
-    echo "ОШИБКА: SECRET_KEY не найден. Возможно, compose вставлен не полностью."
-    exit 1
-fi
-
-echo "[3/7] Проверка docker-compose.yml..."
-docker compose -f "$TMP_COMPOSE" config --quiet
-install -m 600 "$TMP_COMPOSE" "$COMPOSE"
-
-echo "[4/7] Подключение zapret.dat и каталогов логов..."
-
-cat > "$OVERRIDE" <<'OVERRIDE'
+}
+check_zapret_ram() {
+    local ram_kib=$1
+    [[ "$ram_kib" =~ ^[0-9]+$ ]] || die 'Не удалось определить RAM.'
+    (( ram_kib >= 2097152 )) || die 'Для --with-zapret требуется >= 2 GiB RAM. На RU с 870 MiB база ~42 MB привела к OOM.'
+}
+preflight() {
+    (( EUID == 0 )) || die 'Запусти установщик от root (sudo bash).'
+    [[ -r /etc/os-release ]] || die 'Не удалось определить ОС.'
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in ubuntu|debian) ;; *) die 'Поддерживаются только Ubuntu/Debian.' ;; esac
+    [[ -d /run/systemd/system ]] || die 'Требуется работающий systemd.'
+    check_existing_install
+    if [[ "$WITH_ZAPRET" == true ]]; then
+        local ram_kib
+        ram_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+        check_zapret_ram "$ram_kib"
+        echo 'ВНИМАНИЕ: 2 GiB не гарантируют отсутствие OOM. Нужен отдельный тест Xray под нагрузкой.'
+    fi
+}
+read_compose() {
+    echo 'Вставь docker-compose.yml из панели. Заверши отдельной строкой __END__.'
+    local line done=false
+    while IFS= read -r line; do
+        if [[ "$line" == __END__ ]]; then done=true; break; fi
+        printf '%s\n' "$line" >> "$STAGE/docker-compose.yml"
+    done </dev/tty
+    [[ "$done" == true && -s "$STAGE/docker-compose.yml" ]] || die 'Ввод compose не завершён или пуст.'
+    if [[ "$WITH_ZAPRET" == false ]] && grep -qi zapret "$STAGE/docker-compose.yml"; then
+        die 'В compose уже упомянут zapret. Для режима без zapret нужен чистый compose из панели.'
+    fi
+    grep -Eq 'SECRET_KEY[[:space:]]*[=:]' "$STAGE/docker-compose.yml" || die 'SECRET_KEY не найден в compose.'
+}
+write_override() {
+    cat > "$STAGE/docker-compose.override.yml" <<'OVERRIDE'
 services:
   remnanode:
     volumes:
       - /var/log/remnanode:/var/log/remnanode
-      - /opt/remnawave/xray/share/zapret.dat:/usr/local/bin/zapret.dat:ro
 OVERRIDE
-
-chmod 600 "$OVERRIDE"
-
-cat > /etc/logrotate.d/remnanode <<'LOGROTATE'
+    if [[ "$WITH_ZAPRET" == true ]]; then
+        cat >> "$STAGE/docker-compose.override.yml" <<'VOLUME'
+      - type: bind
+        source: /opt/remnawave/xray/share/zapret.dat
+        target: /usr/local/bin/zapret.dat
+        read_only: true
+        bind:
+          create_host_path: false
+VOLUME
+    fi
+}
+download_zapret() {
+    curl --fail --location --silent --show-error --retry 3 \
+        --connect-timeout 20 --max-time 300 --max-filesize 104857600 \
+        --output "$STAGE/zapret.dat" "$ZAPRET_URL"
+    local size
+    size=$(stat -c '%s' "$STAGE/zapret.dat")
+    (( size >= 100000 && size <= 104857600 )) || die 'Недопустимый размер zapret.dat.'
+    echo 'База скачана. Размер не доказывает валидность GeoSite или достаточность RAM.'
+}
+# Explicit files avoid accidentally loading an unrelated Compose override.
+compose() {
+    docker compose --project-directory "$DIR" \
+        -f "$DIR/docker-compose.yml" -f "$DIR/docker-compose.override.yml" "$@"
+}
+cleanup() { if [[ -n "$STAGE" ]]; then rm -rf -- "$STAGE"; fi; }
+main() {
+    parse_args "$@"
+    preflight
+    umask 077
+    STAGE=$(mktemp -d)
+    trap cleanup EXIT
+    trap 'echo "ОШИБКА: установка прервана на строке $LINENO. Повторный запуск не является откатом; проверь частичную установку." >&2' ERR
+    # Read secrets before changing the system, keep staging private.
+    read_compose
+    export DEBIAN_FRONTEND=noninteractive
+    echo '[1/5] Установка зависимостей...'
+    apt-get update
+    apt-get install -y ca-certificates curl logrotate
+    if ! command -v docker >/dev/null 2>&1; then
+        # Download fully before executing; do not execute a partial network stream.
+        curl -fsSL https://get.docker.com -o "$STAGE/get-docker.sh"
+        sh "$STAGE/get-docker.sh"
+    fi
+    if ! docker compose version >/dev/null 2>&1; then apt-get install -y docker-compose-plugin; fi
+    systemctl enable --now docker
+    echo '[2/5] Проверка compose...'
+    write_override
+    # Suppress validation output, which may include secrets from user input.
+    docker compose -f "$STAGE/docker-compose.yml" -f "$STAGE/docker-compose.override.yml" \
+        config --quiet >/dev/null 2>&1 || die 'Compose не прошёл проверку. Секреты не выведены.'
+    local services
+    services=$(docker compose -f "$STAGE/docker-compose.yml" \
+        -f "$STAGE/docker-compose.override.yml" config --services 2>/dev/null)
+    [[ "$services" == remnanode ]] || die 'Compose должен содержать только service remnanode.'
+    if [[ "$WITH_ZAPRET" == true ]]; then download_zapret; fi
+    echo '[3/5] Сохранение конфигурации...'
+    install -d -m 755 "$DIR" "$LOGDIR"
+    install -m 600 "$STAGE/docker-compose.yml" "$DIR/docker-compose.yml"
+    install -m 600 "$STAGE/docker-compose.override.yml" "$DIR/docker-compose.override.yml"
+    if [[ "$WITH_ZAPRET" == true ]]; then
+        install -d -m 755 "$ASSETDIR"
+        install -m 644 "$STAGE/zapret.dat" "$ASSETDIR/zapret.dat"
+    fi
+    cat > /etc/logrotate.d/remnanode <<'LOGROTATE'
 /var/log/remnanode/*.log {
     size 50M
     rotate 5
@@ -166,45 +159,23 @@ cat > /etc/logrotate.d/remnanode <<'LOGROTATE'
     copytruncate
 }
 LOGROTATE
-
-chmod 644 /etc/logrotate.d/remnanode
-logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1
-
-echo "[5/7] Полная проверка конфигурации..."
-cd "$DIR"
-docker compose config --quiet
-
-echo "[6/7] Загрузка и запуск Remnawave Node..."
-docker compose pull
-docker compose up -d
-
-echo "[7/7] Проверка состояния..."
-docker compose ps
-
-NODE_PORT="$(
-    grep -Eo 'NODE_PORT[=:][[:space:]]*"?[0-9]+' "$COMPOSE" |
-    grep -Eo '[0-9]+' |
-    head -n1 || true
-)"
-
-echo
-echo "======================================================"
-echo "REMNAWAVE NODE УСТАНОВЛЕНА"
-echo "======================================================"
-echo "zapret.dat: $ASSETDIR/zapret.dat"
-echo "Таймер обновления: systemctl status remnawave-zapret-update.timer"
-echo "Логи контейнера: cd $DIR && docker compose logs -f -t"
-echo "Xray-логи: tail -F $LOGDIR/access.log $LOGDIR/error.log"
-
-if [[ -n "$NODE_PORT" ]]; then
-    echo
-    echo "NODE_PORT: $NODE_PORT"
-    echo "Разреши его только для IP панели:"
-    echo "ufw insert 1 allow from IP_ПАНЕЛИ to any port $NODE_PORT proto tcp"
-    echo "ufw deny $NODE_PORT/tcp"
-fi
-
-echo
-echo "В профиле Xray используй:"
-echo "  ext:zapret.dat:zapret"
-echo "  ext:zapret.dat:zapret-zapad"
+    chmod 644 /etc/logrotate.d/remnanode
+    logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1
+    echo '[4/5] Загрузка и запуск контейнера...'
+    compose config --quiet >/dev/null 2>&1 || die 'Итоговый Compose не прошёл проверку.'
+    compose pull
+    compose up -d
+    echo '[5/5] Состояние контейнера...'
+    compose ps
+    echo 'Контейнер запущен. Это ещё не подтверждает работу Xray и клиентского VPN.'
+    echo 'Проверь связь с панелью, активные inbounds, порты, память и клиентский выходной IP.'
+    if [[ "$WITH_ZAPRET" == true ]]; then
+        echo 'zapret.dat подключён однократно. Автообновления и таймера нет.'
+        echo 'Правила ext:zapret.dat в Xray не добавлены. Их применение требует отдельной проверки.'
+    else
+        echo 'Установка без zapret: база, загрузчик и таймер не создавались.'
+    fi
+    echo "Логи: cd $DIR && docker compose logs --tail=100 -t"
+    echo 'Firewall не изменён. Доступ к Node API согласуй отдельно, только с IP панели.'
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

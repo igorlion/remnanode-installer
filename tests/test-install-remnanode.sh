@@ -40,6 +40,19 @@ check_zapret_ram 2097152
 for ram in 890880 2097151 invalid ''; do
     if (check_zapret_ram "$ram" >/dev/null 2>&1); then fail "RAM accepted: $ram"; fi
 done
+# Read a supplied file exactly (including a last line without newline), no END marker.
+WITH_ZAPRET=false
+COMPOSE_INPUT="$TEST_DIR/input.yml"
+printf 'services:\n  remnanode:\n    environment:\n      SECRET_KEY: TEST_ONLY' > "$COMPOSE_INPUT"
+read_compose
+cmp "$COMPOSE_INPUT" "$STAGE/docker-compose.yml" || fail 'Input file was altered'
+if (COMPOSE_INPUT="$TEST_DIR/missing"; read_compose >/dev/null 2>&1); then fail 'Missing file accepted'; fi
+: > "$TEST_DIR/empty"
+if (COMPOSE_INPUT="$TEST_DIR/empty"; read_compose >/dev/null 2>&1); then fail 'Empty file accepted'; fi
+if (parse_args --compose-file >/dev/null 2>&1); then fail 'Missing file argument accepted'; fi
+if (COMPOSE_INPUT=; parse_args --compose-file one --compose-file two >/dev/null 2>&1); then fail 'Duplicate file option accepted'; fi
+(COMPOSE_INPUT=; WITH_ZAPRET=false; parse_args --compose-file "$TEST_DIR/input.yml" --with-zapret
+ [[ "$COMPOSE_INPUT" == "$TEST_DIR/input.yml" && "$WITH_ZAPRET" == true ]]) || fail 'Combined options failed'
 # Check argument handling in subshells because --help/invalid exit intentionally.
 ("$BASH" "$ROOT/install-remnanode.sh" --help) >/dev/null
 if (parse_args --unknown >/dev/null 2>&1); then fail 'Unknown option accepted'; fi

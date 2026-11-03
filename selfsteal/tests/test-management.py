@@ -9,6 +9,8 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[1] / 'install-selfsteal.sh'
 
 DOUBLES = r'''
+# All paths and service calls are isolated; no root privileges are needed here.
+need_root() { :; }
 systemctl() {
   case "$1" in
     show) echo 99 ;;

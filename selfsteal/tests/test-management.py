@@ -29,6 +29,10 @@ getent() { if [[ "$1" == ahostsv4 ]]; then printf '8.8.8.8 STREAM node\n'; fi; }
 ip() { :; }
 sleep() { :; }
 journalctl() { :; }
+runuser() {
+  [[ "$1" == -u && "$2" == caddy && "$3" == -- && "$4" == test && "$5" == -x ]] || return 2
+  [[ "${DENY_WEB_PARENT:-0}" != 1 ]] && test -x "$6"
+}
 curl() {
   [[ "${FAIL_CERT:-0}" != 1 ]] || return 60
   if [[ "${WRONG_PAGE:-0}" == 1 ]]; then echo 'another website'; else cat "$WEB_ROOT/index.html"; fi
@@ -86,6 +90,19 @@ class ManagementTests(unittest.TestCase):
 
     def install(self, **env):
         return self.run_shell('main --domain node.example.com --expected-ip 8.8.8.8', **env)
+
+    def test_missing_web_parent_is_created_with_traverse_permissions(self):
+        result = self.run_shell('WEB_ROOT="$TEST_ROOT/new-parent/site"; prepare_web_parent')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'new-parent').stat().st_mode & 0o777, 0o755)
+
+    def test_inaccessible_web_parent_is_rejected_without_chmod(self):
+        original_mode = self.root.stat().st_mode & 0o777
+        result = self.install(DENY_WEB_PARENT='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Пользователь caddy не может пройти', result.stderr)
+        self.assertEqual(self.root.stat().st_mode & 0o777, original_mode)
+        self.assertFalse((self.root / 'www/index.html').exists())
 
     def test_upgrade_preserves_page_and_installs_management(self):
         self.existing()

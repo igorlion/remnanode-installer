@@ -241,7 +241,20 @@ begin_transaction() {
   trap 'exit 143' TERM
 }
 
+prepare_web_parent() {
+  local parent
+  parent=$(dirname -- "$WEB_ROOT")
+  need_commands runuser
+  # Explicitly create the parent: umask 077 otherwise makes it inaccessible to Caddy.
+  if [[ ! -e "$parent" && ! -L "$parent" ]]; then
+    install -d -m 0755 "$parent"
+  fi
+  runuser -u caddy -- test -x "$parent" \
+    || die "Пользователь caddy не может пройти в $parent. Проверьте права каталога; существующие права скрипт не меняет."
+}
+
 write_page() {
+  prepare_web_parent
   if [[ -n "$PAGE_FILE" ]]; then
     [[ -f "$PAGE_FILE" && -s "$PAGE_FILE" ]] || die "HTML-файл отсутствует или пуст: $PAGE_FILE"
     install -d -m 0755 "$WEB_ROOT"
@@ -464,7 +477,7 @@ main() {
   printf '\n'
   if (( cert_ok == 0 )); then
     journalctl -u caddy --since '-10 minutes' --no-pager -n 160 || true
-    die "Сертификат не выпущен. Проверьте доступность публичного TCP/80."
+    die "Проверка локального HTTPS не пройдена: возможна ошибка TLS, HTTP или несовпадение страницы. Проверьте журнал Caddy, права страницы и ответ HTTPS; при ошибке ACME — доступность публичного TCP/80."
   fi
 
   check_listeners || die "HTTPS должен слушать только 127.0.0.1:8443, без UDP/8443."
@@ -672,3 +685,4 @@ dispatch() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   dispatch "$@"
 fi
+

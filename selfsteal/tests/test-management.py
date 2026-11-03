@@ -92,7 +92,9 @@ class ManagementTests(unittest.TestCase):
         return self.run_shell('main --domain node.example.com --expected-ip 8.8.8.8', **env)
 
     def test_missing_web_parent_is_created_with_traverse_permissions(self):
-        result = self.run_shell('WEB_ROOT="$TEST_ROOT/new-parent/site"; prepare_web_parent')
+        self.script.write_text(self.script.read_text().replace(
+            str(self.root / 'www'), str(self.root / 'new-parent/site')))
+        result = self.run_shell('prepare_web_parent')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / 'new-parent').stat().st_mode & 0o777, 0o755)
 

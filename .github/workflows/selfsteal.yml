@@ -1,0 +1,17 @@
+name: Selfsteal checks
+on:
+  push:
+    paths: ['selfsteal/**', '.github/workflows/selfsteal.yml']
+  pull_request:
+    paths: ['selfsteal/**', '.github/workflows/selfsteal.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax, static analysis and self-test
+        run: bash selfsteal/tests/test-install-selfsteal.sh
+      - name: Transaction and failure scenarios (isolated filesystem)
+        run: python3 selfsteal/tests/test-management.py

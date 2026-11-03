@@ -7,11 +7,13 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION="1.0.2"
+readonly VERSION="1.1.0"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly WEB_ROOT="/var/www/remnawave-selfsteal"
 readonly STATE_FILE="/etc/remnawave-selfsteal.conf"
 readonly BACKUP_ROOT="/var/lib/remnawave-selfsteal/backups"
+readonly CLI_FILE="/usr/local/sbin/remnawave-selfsteal"
+readonly LOCK_FILE="/run/lock/remnawave-selfsteal.lock"
 readonly MANAGED_MARKER="# Managed by remnawave-selfsteal"
 
 DOMAIN=""
@@ -20,9 +22,8 @@ FORCE=0
 SUCCESS=0
 WORKDIR=""
 BACKUP_DIR=""
-CADDYFILE_BACKUP=""
-INDEX_BACKUP=""
-HAD_INDEX=0
+PAGE_FILE=""
+ACTION="install"
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -33,6 +34,9 @@ usage() {
   cat <<'EOF'
 Использование:
   sudo bash install-selfsteal.sh [--domain ИМЯ] [--expected-ip IPv4] [--force]
+  sudo remnawave-selfsteal menu|status|check|start|stop|restart|logs|backup|backups
+  sudo remnawave-selfsteal restore ИМЯ_КОПИИ
+  sudo remnawave-selfsteal page /путь/страница.html
   bash install-selfsteal.sh self-test
 
 Обычный запуск спрашивает домен. Публичный IPv4 определяется автоматически,
@@ -41,6 +45,7 @@ usage() {
 Опции:
   --domain ИМЯ          Домен Reality/Selfsteal, например brr1.example.com.
   --expected-ip IPv4    Ожидаемый IPv4 сервера, если автоопределение недоступно.
+  --page ФАЙЛ           Своя HTML-страница (при повторном запуске страница сохраняется).
   --force               Разрешить замену чужого существующего Caddyfile.
   -h, --help            Показать справку.
 
@@ -126,37 +131,115 @@ port_listeners() {
 }
 
 assert_port_available_or_caddy() {
-  local port=$1 listeners
+  local port=$1 listeners line pid
   listeners=$(port_listeners "$port")
   [[ -z "$listeners" ]] && return 0
-  if grep -q 'caddy' <<< "$listeners"; then
-    return 0
+  pid=$(systemctl show caddy --property=MainPID --value 2>/dev/null || true)
+  while IFS= read -r line; do
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] || [[ "$line" != *"pid=${pid},"* ]] \
+       || [[ "$line" != *'"caddy"'* ]]; then
+      printf '%s\n' "$listeners" >&2
+      die "Порт $port занят чужим процессом (включая Caddy в Docker). Ничего не изменено."
+    fi
+  done <<< "$listeners"
+}
+
+acquire_lock() {
+  need_commands flock
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Другой процесс Selfsteal уже выполняет изменения."
+}
+
+assert_managed() {
+  local first_line
+  [[ -f "$CADDYFILE" ]] || die "Caddyfile не найден."
+  first_line=$(head -n1 "$CADDYFILE")
+  [[ "$first_line" == "${MANAGED_MARKER} "* ]] || die "Caddyfile не принадлежит Selfsteal. Управление отменено."
+  load_saved_domain || die "Не найден корректный сохранённый домен."
+}
+
+create_backup() {
+  install -d -m 0700 "$BACKUP_ROOT"
+  BACKUP_DIR=$(mktemp -d "${BACKUP_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+  local name file
+  for name in Caddyfile index.html state cli; do
+    case "$name" in
+      Caddyfile) file=$CADDYFILE ;;
+      index.html) file=$WEB_ROOT/index.html ;;
+      state) file=$STATE_FILE ;;
+      cli) file=$CLI_FILE ;;
+    esac
+    if [[ -f "$file" ]]; then
+      cp -p -- "$file" "$BACKUP_DIR/$name"
+      touch "$BACKUP_DIR/had-$name"
+    fi
+  done
+  if systemctl is-active --quiet caddy; then touch "$BACKUP_DIR/active"; fi
+  systemctl is-enabled caddy > "$BACKUP_DIR/enabled" 2>/dev/null || true
+  touch "$BACKUP_DIR/complete-v1"
+}
+
+restore_snapshot() {
+  local snapshot=$1 name file
+  [[ -f "$snapshot/complete-v1" ]] || return 1
+  for name in Caddyfile index.html state cli; do
+    case "$name" in
+      Caddyfile) file=$CADDYFILE ;;
+      index.html) file=$WEB_ROOT/index.html ;;
+      state) file=$STATE_FILE ;;
+      cli) file=$CLI_FILE ;;
+    esac
+    if [[ -f "$snapshot/had-$name" ]]; then
+      mkdir -p -- "$(dirname -- "$file")" || return 1
+      cp -p -- "$snapshot/$name" "$file" || return 1
+    else
+      rm -f -- "$file" || return 1
+    fi
+  done
+  if [[ -f "$snapshot/active" ]]; then
+    systemctl restart caddy || return 1
+  else
+    systemctl stop caddy || return 1
   fi
-  printf '%s\n' "$listeners" >&2
-  die "Порт $port уже занят не Caddy. Ничего не изменено."
+  case "$(cat "$snapshot/enabled")" in
+    enabled) systemctl enable caddy >/dev/null || return 1 ;;
+    enabled-runtime) systemctl enable --runtime caddy >/dev/null || return 1 ;;
+    masked) systemctl mask caddy >/dev/null || return 1 ;;
+    masked-runtime) systemctl mask --runtime caddy >/dev/null || return 1 ;;
+    disabled|not-found|"") systemctl disable caddy >/dev/null || return 1 ;;
+  esac
 }
 
 rollback() {
   local rc=$?
-  [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf -- "$WORKDIR"
-  (( SUCCESS == 1 )) && return 0
-  [[ -n "$BACKUP_DIR" ]] || return "$rc"
-
-  warn "Настройка не завершена. Восстанавливаю прежние файлы Caddy."
-  if [[ -n "$CADDYFILE_BACKUP" && -f "$CADDYFILE_BACKUP" ]]; then
-    install -m 0644 "$CADDYFILE_BACKUP" "$CADDYFILE"
+  trap - EXIT
+  if (( SUCCESS == 0 )) && [[ -n "$BACKUP_DIR" ]]; then
+    warn "Ошибка. Восстанавливаю файлы и прежнее состояние Caddy из $BACKUP_DIR"
+    if ! restore_snapshot "$BACKUP_DIR"; then
+      warn "Автоматическое восстановление не завершилось. Копия: $BACKUP_DIR"
+      rc=1
+    fi
   fi
-  if (( HAD_INDEX == 1 )) && [[ -f "$INDEX_BACKUP" ]]; then
-    install -d -m 0755 "$WEB_ROOT"
-    install -m 0644 "$INDEX_BACKUP" "$WEB_ROOT/index.html"
-  else
-    rm -f -- "$WEB_ROOT/index.html"
-  fi
-  systemctl restart caddy >/dev/null 2>&1 || true
+  [[ -z "$WORKDIR" || ! -d "$WORKDIR" ]] || rm -rf -- "$WORKDIR"
   return "$rc"
 }
 
+begin_transaction() {
+  create_backup
+  SUCCESS=0
+  trap rollback EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 write_page() {
+  if [[ -n "$PAGE_FILE" ]]; then
+    [[ -f "$PAGE_FILE" && -s "$PAGE_FILE" ]] || die "HTML-файл отсутствует или пуст: $PAGE_FILE"
+    install -d -m 0755 "$WEB_ROOT"
+    install -m 0644 "$PAGE_FILE" "$WEB_ROOT/index.html"
+    return
+  fi
+  [[ ! -f "$WEB_ROOT/index.html" ]] || return 0
   install -d -m 0755 "$WEB_ROOT"
   install -m 0644 /dev/null "$WEB_ROOT/index.html"
   cat > "$WEB_ROOT/index.html" <<'HTML'
@@ -232,11 +315,11 @@ self_test() {
   need_commands python3
   validate_domain example.com
   validate_domain node-1.example.com
-  ! validate_domain localhost
-  ! validate_domain '-bad.example.com'
-  ! validate_domain 'bad_.example.com'
+  if validate_domain localhost; then die "Self-test: принят некорректный домен."; fi
+  if validate_domain '-bad.example.com'; then die "Self-test: принят некорректный домен."; fi
+  if validate_domain 'bad_.example.com'; then die "Self-test: принят некорректный домен."; fi
   validate_ipv4 8.8.8.8 >/dev/null 2>&1
-  ! validate_ipv4 127.0.0.1 >/dev/null 2>&1
+  if validate_ipv4 127.0.0.1 >/dev/null 2>&1; then die "Self-test: принят локальный IPv4."; fi
   printf '%s\n' "[ OK ] Self-test ${VERSION} пройден."
 }
 
@@ -253,6 +336,11 @@ parse_args() {
         shift
         EXPECTED_IP=$1
         ;;
+      --page)
+        (($# >= 2)) || die "После --page нужен путь."
+        shift
+        PAGE_FILE=$1
+        ;;
       --force) FORCE=1 ;;
       -h|--help) usage; exit 0 ;;
       *) die "Неизвестный аргумент: $1" ;;
@@ -264,7 +352,13 @@ parse_args() {
 main() {
   parse_args "$@"
   need_root
-  need_commands apt-get curl getent awk sed grep sort ss ip python3 systemctl install openssl
+  need_commands apt-get curl getent awk sed grep sort ss ip python3 systemctl install openssl flock realpath sha256sum
+  acquire_lock
+  if [[ -n "$PAGE_FILE" ]]; then
+    [[ -f "$PAGE_FILE" && -s "$PAGE_FILE" ]] || die "HTML-файл отсутствует или пуст: $PAGE_FILE"
+    PAGE_FILE=$(realpath -- "$PAGE_FILE")
+    [[ "$PAGE_FILE" != "$WEB_ROOT/index.html" ]] || PAGE_FILE=""
+  fi
 
   if [[ -z "$DOMAIN" ]]; then
     if load_saved_domain; then
@@ -286,11 +380,15 @@ main() {
   fi
   validate_ipv4 "$EXPECTED_IP" || die "Некорректный публичный IPv4: $EXPECTED_IP"
 
-  local dns_v4 dns_v6 local_v6
-  dns_v4=$(resolve_ipv4 "$DOMAIN")
+  local dns_v4 dns_v6 local_v6 address
+  dns_v4=$(resolve_ipv4 "$DOMAIN" || true)
   [[ -n "$dns_v4" ]] || die "У $DOMAIN не найдена A-запись."
   grep -Fxq "$EXPECTED_IP" <<< "$dns_v4" \
     || die "$DOMAIN указывает на ${dns_v4//$'\n'/, }, а IPv4 этой ноды: $EXPECTED_IP"
+
+  while IFS= read -r address; do
+    [[ "$address" == "$EXPECTED_IP" ]] || die "Лишняя A-запись $address: все A-записи должны вести на эту ноду."
+  done <<< "$dns_v4"
 
   dns_v6=$(resolve_ipv6 "$DOMAIN")
   if [[ -n "$dns_v6" ]]; then
@@ -305,32 +403,19 @@ main() {
   assert_port_available_or_caddy 80
   assert_port_available_or_caddy 8443
 
-  local caddy_preexisting=0
-  command -v caddy >/dev/null 2>&1 && caddy_preexisting=1
-  if (( caddy_preexisting == 1 )) && [[ -s "$CADDYFILE" ]] \
-     && ! grep -Fq "$MANAGED_MARKER" "$CADDYFILE" \
+  if [[ -s "$CADDYFILE" ]] \
+     && [[ "$(head -n1 "$CADDYFILE")" != "${MANAGED_MARKER} "* ]] \
      && (( FORCE == 0 )); then
     die "Обнаружен чужой Caddyfile. Проверьте $CADDYFILE и повторите с --force только если его можно заменить."
   fi
 
+  begin_transaction
   info "Устанавливаю необходимые пакеты."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates caddy curl openssl
   need_commands caddy
 
-  install -d -m 0700 "$BACKUP_ROOT"
-  BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
-  install -d -m 0700 "$BACKUP_DIR"
-  CADDYFILE_BACKUP="$BACKUP_DIR/Caddyfile"
-  INDEX_BACKUP="$BACKUP_DIR/index.html"
-  [[ -f "$CADDYFILE" ]] && install -m 0600 "$CADDYFILE" "$CADDYFILE_BACKUP"
-  if [[ -f "$WEB_ROOT/index.html" ]]; then
-    HAD_INDEX=1
-    install -m 0600 "$WEB_ROOT/index.html" "$INDEX_BACKUP"
-  fi
-
   WORKDIR=$(mktemp -d)
-  trap rollback EXIT
 
   write_page
   write_caddyfile "$WORKDIR/Caddyfile"
@@ -348,11 +433,7 @@ main() {
   info "Жду выпуск сертификата через HTTP-01 на публичном порту 80."
   local attempt cert_ok=0
   for attempt in $(seq 1 60); do
-    if curl -fsS --connect-timeout 5 --max-time 10 \
-      --resolve "${DOMAIN}:8443:127.0.0.1" \
-      "https://${DOMAIN}:8443/" \
-      2>/dev/null \
-      | grep -Fq 'All systems operational'; then
+    if https_check 8443 2>/dev/null; then
       cert_ok=1
       break
     fi
@@ -365,13 +446,11 @@ main() {
     die "Сертификат не выпущен. Проверьте доступность публичного TCP/80."
   fi
 
-  local tcp_8443 udp_8443
-  tcp_8443=$(ss -lntpH 'sport = :8443' 2>/dev/null || true)
-  udp_8443=$(ss -lnupH 'sport = :8443' 2>/dev/null || true)
-  grep -q '127.0.0.1:8443' <<< "$tcp_8443" || die "Caddy не слушает 127.0.0.1:8443."
-  [[ -z "$udp_8443" ]] || die "Caddy неожиданно открыл UDP/8443; HTTP/3 не отключён."
+  check_listeners || die "HTTPS должен слушать только 127.0.0.1:8443, без UDP/8443."
 
-  install -m 0755 "${BASH_SOURCE[0]}" /usr/local/sbin/remnawave-selfsteal
+  if [[ "$(realpath -- "${BASH_SOURCE[0]}")" != "$CLI_FILE" ]]; then
+    install -m 0755 "${BASH_SOURCE[0]}" "$CLI_FILE"
+  fi
   printf 'DOMAIN=%s\nPUBLIC_IPV4=%s\n' "$DOMAIN" "$EXPECTED_IP" > "$STATE_FILE"
   chmod 0600 "$STATE_FILE"
 
@@ -387,8 +466,188 @@ main() {
   printf 'Резервная копия: %s\n' "$BACKUP_DIR"
 }
 
-if [[ ${1:-} == self-test ]]; then
-  self_test
-else
-  main "$@"
+# Read-only checks do not reload Caddy, alter Xray or bypass certificate validation.
+https_check() {
+  local port=$1 actual expected
+  [[ -f "$WEB_ROOT/index.html" ]] || return 1
+  actual=$(curl --noproxy '*' -fsS --connect-timeout 3 --max-time 8 \
+    --resolve "${DOMAIN}:${port}:127.0.0.1" "https://${DOMAIN}:${port}/" | sha256sum | awk '{print $1}') || return 1
+  expected=$(sha256sum "$WEB_ROOT/index.html" | awk '{print $1}') || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+check_listeners() {
+  local tcp udp line
+  tcp=$(ss -lntpH 'sport = :8443') || return 1
+  udp=$(ss -lnupH 'sport = :8443') || return 1
+  [[ -n "$tcp" && -z "$udp" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$(awk '{print $4}' <<< "$line")" == '127.0.0.1:8443' ]] || return 1
+  done <<< "$tcp"
+}
+
+show_status() {
+  printf 'Selfsteal %s\n' "$VERSION"
+  load_saved_domain || { warn "Сохранённый домен отсутствует."; return 1; }
+  printf 'Домен: %s\nTarget: 127.0.0.1:8443\n' "$DOMAIN"
+  systemctl --no-pager --full status caddy || return 1
+}
+
+check_health() {
+  assert_managed
+  local failed=0 cert
+  if check_listeners; then
+    ok 'HTTPS слушает только 127.0.0.1:8443; UDP/8443 закрыт.'
+  else
+    warn 'Проверьте TCP/8443 и UDP/8443: цель отсутствует или доступна извне.'
+    failed=1
+  fi
+  if https_check 8443; then
+    ok 'Локальный HTTPS: доверенная цепочка, правильный домен, успешный HTTP-ответ.'
+  else
+    warn 'Локальный HTTPS, сертификат или содержимое страницы не прошли проверку.'
+    failed=1
+  fi
+  if https_check 443; then
+    ok 'HTTPS через локальный вход 443: доверенный сертификат, содержимое совпадает с нашей страницей.'
+    info 'Это проверка fallback с самой ноды; доступность из РФ и VPN-туннель проверяются клиентом.'
+  else
+    warn 'HTTPS через вход 443 не прошёл проверку. Проверьте target/SNI в панели и слушатель Xray.'
+    failed=1
+  fi
+  cert=$(timeout 5 openssl s_client -connect 127.0.0.1:8443 -servername "$DOMAIN" \
+    </dev/null 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null) || true
+  [[ -z "$cert" ]] || printf 'Сертификат: %s\n' "$cert"
+  info 'Caddy продлевает сертификат автоматически через HTTP-01; публичный TCP/80 должен оставаться доступным.'
+  return "$failed"
+}
+
+list_backups() {
+  [[ -d "$BACKUP_ROOT" ]] || { info 'Резервных копий пока нет.'; return 0; }
+  local directory
+  for directory in "$BACKUP_ROOT"/*; do
+    [[ -f "$directory/complete-v1" ]] || continue
+    basename -- "$directory"
+  done
+}
+
+restore_backup() {
+  local name=${1:-} snapshot
+  [[ "$name" =~ ^[0-9]{8}T[0-9]{6}Z-[a-zA-Z0-9]{6}$ ]] || die 'Укажите имя из команды backups.'
+  snapshot="$BACKUP_ROOT/$name"
+  [[ -d "$snapshot" && ! -L "$snapshot" && -f "$snapshot/complete-v1" ]] || die 'Копия не найдена или имеет старый формат.'
+  # Check the old configuration before changing the current files.
+  if [[ -f "$snapshot/had-Caddyfile" ]]; then
+    caddy validate --config "$snapshot/Caddyfile" --adapter caddyfile
+  fi
+  begin_transaction
+  restore_snapshot "$snapshot"
+  SUCCESS=1
+  ok "Восстановлено из $name. Состояние до восстановления сохранено в $BACKUP_DIR"
+  warn 'После смены домена согласуйте SNI и target в панели Remnawave; панель скрипт не меняет.'
+}
+
+management() {
+  local action=$1
+  shift
+  need_root
+  need_commands systemctl ss curl openssl timeout awk grep sed head sha256sum realpath
+  case "$action" in
+    status) show_status ;;
+    check) check_health ;;
+    logs) assert_managed; journalctl -u caddy --no-pager -n 100 ;;
+    backups) list_backups ;;
+    start|stop|restart)
+      acquire_lock
+      assert_managed
+      if [[ "$action" != stop ]]; then
+        caddy validate --config "$CADDYFILE" --adapter caddyfile
+        assert_port_available_or_caddy 80
+        assert_port_available_or_caddy 8443
+      fi
+      systemctl "$action" caddy
+      ;;
+    backup)
+      acquire_lock
+      assert_managed
+      create_backup
+      ok "Резервная копия: $BACKUP_DIR"
+      ;;
+    restore)
+      acquire_lock
+      assert_managed
+      restore_backup "$@"
+      ;;
+    page)
+      acquire_lock
+      assert_managed
+      PAGE_FILE=${1:-}
+      [[ -f "$PAGE_FILE" && -s "$PAGE_FILE" ]] || die 'Укажите непустой HTML-файл.'
+      [[ "$(realpath -- "$PAGE_FILE")" != "$WEB_ROOT/index.html" ]] || die 'Эта страница уже установлена.'
+      begin_transaction
+      write_page
+      https_check 8443
+      SUCCESS=1
+      ok "Страница обновлена. Резервная копия: $BACKUP_DIR"
+      ;;
+    *) die "Неизвестная команда: $action" ;;
+  esac
+}
+
+menu_action() {
+  if bash "${BASH_SOURCE[0]}" "$@"; then
+    return 0
+  else
+    warn 'Операция не завершена. Меню остаётся доступным; причина показана выше.'
+  fi
+}
+
+menu() {
+  [[ -t 0 ]] || die 'Для меню нужен интерактивный терминал; используйте status/check/install.'
+  local choice backup_name page
+  while true; do
+    printf '\nSelfsteal %s\n1) Статус\n2) Проверка HTTPS и сертификата\n3) Логи\n4) Запустить\n5) Остановить\n6) Перезапустить\n7) Резервная копия\n8) Список копий\n9) Восстановить копию\n10) Заменить HTML-страницу\n11) Установка / перенастройка\n0) Выход\n' "$VERSION"
+    read -r -p 'Выбор: ' choice || return 0
+    # Each action is a separate process: errexit and rollback remain effective.
+    case "$choice" in
+      1) menu_action status ;;
+      2) menu_action check ;;
+      3) menu_action logs ;;
+      4) menu_action start ;;
+      5) menu_action stop ;;
+      6) menu_action restart ;;
+      7) menu_action backup ;;
+      8) menu_action backups ;;
+      9)
+        menu_action backups
+        read -r -p 'Имя копии: ' backup_name || return 0
+        menu_action restore "$backup_name"
+        ;;
+      10)
+        read -r -p 'Путь к HTML-файлу: ' page || return 0
+        menu_action page "$page"
+        ;;
+      11) menu_action install ;;
+      0) return 0 ;;
+      *) warn 'Неизвестный пункт.' ;;
+    esac
+  done
+}
+
+dispatch() {
+  ACTION=${1:-}
+  case "$ACTION" in
+    self-test) self_test ;;
+    menu) menu ;;
+    status|check|start|stop|restart|logs|backup|backups|restore|page) management "$@" ;;
+    install) shift; main "$@" ;;
+    '')
+      if [[ -t 0 && -f "$STATE_FILE" ]]; then menu; else main; fi
+      ;;
+    *) main "$@" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  dispatch "$@"
 fi

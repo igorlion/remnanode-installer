@@ -24,6 +24,7 @@ WORKDIR=""
 BACKUP_DIR=""
 PAGE_FILE=""
 ACTION="install"
+CADDY_LOG_PID=""
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -210,9 +211,17 @@ restore_snapshot() {
   esac
 }
 
+stop_caddy_logs() {
+  [[ -n "$CADDY_LOG_PID" ]] || return 0
+  kill "$CADDY_LOG_PID" 2>/dev/null || true
+  wait "$CADDY_LOG_PID" 2>/dev/null || true
+  CADDY_LOG_PID=""
+}
+
 rollback() {
   local rc=$?
   trap - EXIT
+  stop_caddy_logs
   if (( SUCCESS == 0 )) && [[ -n "$BACKUP_DIR" ]]; then
     warn "Ошибка. Восстанавливаю файлы и прежнее состояние Caddy из $BACKUP_DIR"
     if ! restore_snapshot "$BACKUP_DIR"; then
@@ -424,6 +433,17 @@ main() {
   install -m 0644 "$WORKDIR/Caddyfile" "$CADDYFILE"
 
   systemctl enable caddy >/dev/null
+  if command -v journalctl >/dev/null 2>&1; then
+    info "Показываю журнал Caddy/ACME в реальном времени до завершения проверки сертификата."
+    local caddy_log_since
+    caddy_log_since=$(date '+%Y-%m-%d %H:%M:%S')
+    # Include records emitted during start/reload; close the inherited lock FD.
+    journalctl -u caddy --since "$caddy_log_since" \
+      --follow --no-tail --no-pager -o cat 9>&- &
+    CADDY_LOG_PID=$!
+  else
+    warn "journalctl не найден; ход выпуска можно проверить в журнале Caddy."
+  fi
   if systemctl is-active --quiet caddy; then
     systemctl reload caddy
   else
@@ -437,9 +457,10 @@ main() {
       cert_ok=1
       break
     fi
-    printf 'Проверка сертификата: %s/60\r' "$attempt"
+    printf 'Проверка сертификата: %s/60\n' "$attempt"
     sleep 2
   done
+  stop_caddy_logs
   printf '\n'
   if (( cert_ok == 0 )); then
     journalctl -u caddy --since '-10 minutes' --no-pager -n 160 || true

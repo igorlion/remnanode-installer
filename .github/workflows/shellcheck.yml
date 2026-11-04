@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - "install-remnanode.sh"
+      - "tests/test-install-remnanode.sh"
       - ".github/workflows/shellcheck.yml"
   pull_request:
     paths:
       - "install-remnanode.sh"
+      - "tests/test-install-remnanode.sh"
       - ".github/workflows/shellcheck.yml"
 
 permissions:
@@ -19,4 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check installer
-        run: shellcheck install-remnanode.sh
+        run: shellcheck install-remnanode.sh tests/test-install-remnanode.sh
+      - name: Installer regression tests
+        run: bash tests/test-install-remnanode.sh
